@@ -77,6 +77,111 @@ def quantize_fused_gpu(x: torch.Tensor, group_size: int = 32) -> Tuple[torch.Ten
 
 
 # -------------------------------------------------------------------------
+# 1b. Fused AMO-BQ Quantization Kernel (BF16 -> UINT8 + BF16 Scale + UINT8 ZP in 1 Pass)
+# -------------------------------------------------------------------------
+@triton.jit
+def _fused_amo_quant_kernel(
+    x_ptr, q_ptr, scales_ptr, zp_ptr, n_elements,
+    GROUP_SIZE: tl.constexpr,
+    NUM_CANDIDATES: tl.constexpr,
+    LO: tl.constexpr,
+    HI: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    offs = pid * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+    mask = offs < n_elements
+    vals = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+
+    # Per-block min/max (padded ensures full blocks)
+    b_min = tl.min(vals, axis=0)
+    b_max = tl.max(vals, axis=0)
+    b_range = tl.maximum(b_max - b_min, 1e-8)
+    s0 = b_range / 255.0
+
+    best_err = 3.4e38
+    best_s = s0 * LO
+    # init zp for best_s (not used except for first compare)
+    best_zp = tl.clamp(tl.where(-b_min / best_s >= 0, -b_min / best_s + 0.5, -b_min / best_s - 0.5).to(tl.int32).to(tl.float32), 0.0, 255.0)
+
+    for c in range(NUM_CANDIDATES):
+        m = LO + (HI - LO) * c / (NUM_CANDIDATES - 1) if NUM_CANDIDATES > 1 else LO
+        s_c = s0 * m
+        inv = -b_min / s_c
+        zp_c = tl.clamp(tl.where(inv >= 0, inv + 0.5, inv - 0.5).to(tl.int32).to(tl.float32), 0.0, 255.0)
+        q_c = tl.clamp(tl.where(vals / s_c + zp_c >= 0, vals / s_c + zp_c + 0.5, vals / s_c + zp_c - 0.5).to(tl.int32).to(tl.float32), 0.0, 255.0)
+        rec = (q_c - zp_c) * s_c
+        diff = vals - rec
+        err = tl.sum(diff * diff, axis=0)
+        is_better = err < best_err
+        best_err = tl.where(is_better, err, best_err)
+        best_s = tl.where(is_better, s_c, best_s)
+        best_zp = tl.where(is_better, zp_c, best_zp)
+
+    q_final = tl.clamp(tl.where(vals / best_s + best_zp >= 0, vals / best_s + best_zp + 0.5, vals / best_s + best_zp - 0.5).to(tl.int32).to(tl.float32), 0.0, 255.0).to(tl.uint8)
+    tl.store(q_ptr + offs, q_final, mask=mask)
+    tl.store(scales_ptr + pid, best_s.to(tl.bfloat16))
+    tl.store(zp_ptr + pid, best_zp.to(tl.uint8))
+
+
+def quantize_amo_fused_gpu(
+    x: torch.Tensor,
+    group_size: int = 32,
+    mode: str = "balanced",
+    num_candidates: Optional[int] = None,
+    lo: Optional[float] = None,
+    hi: Optional[float] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Tuple[int, ...]]:
+    """
+    Fused AMO-BQ quantizer (Triton, 1 pass). Falls back to PyTorch if no Triton/CUDA.
+    """
+    # Resolve preset if mode given
+    if mode is not None:
+        from .codec import AMO_BQ_PRESETS
+        if mode not in AMO_BQ_PRESETS:
+            raise ValueError(f"Unknown mode {mode}")
+        pn, plo, phi, _ = AMO_BQ_PRESETS[mode]
+        num_candidates = pn if num_candidates is None else num_candidates
+        lo = plo if lo is None else lo
+        hi = phi if hi is None else hi
+    else:
+        if num_candidates is None:
+            num_candidates = 32
+        if lo is None:
+            lo = 0.95
+        if hi is None:
+            hi = 1.05
+
+    orig_shape = x.shape
+    numel = x.numel()
+    pad_len = (group_size - (numel % group_size)) % group_size
+    if pad_len > 0:
+        x_flat = F.pad(x.flatten(), (0, pad_len))
+    else:
+        x_flat = x.flatten().contiguous()
+
+    # Ensure float32 for Triton (bf16 loads as float32)
+    if x_flat.dtype != torch.float32:
+        x_flat = x_flat.float()
+    # Triton expects contiguous
+    x_flat = x_flat.contiguous()
+
+    num_blocks = x_flat.numel() // group_size
+    q_out = torch.empty(x_flat.shape[0], dtype=torch.uint8, device=x.device)
+    scales_out = torch.empty(num_blocks, dtype=torch.bfloat16, device=x.device)
+    zp_out = torch.empty(num_blocks, dtype=torch.uint8, device=x.device)
+
+    grid = (num_blocks,)
+    _fused_amo_quant_kernel[grid](
+        x_flat, q_out, scales_out, zp_out, x_flat.numel(),
+        GROUP_SIZE=group_size,
+        NUM_CANDIDATES=num_candidates,
+        LO=lo,
+        HI=hi,
+    )
+    return q_out[:numel], scales_out, zp_out, orig_shape
+
+
+# -------------------------------------------------------------------------
 # 2. Fused Dequantization Kernel (INT8 + Scale -> BF16 in 1 Pass)
 # -------------------------------------------------------------------------
 @triton.jit
