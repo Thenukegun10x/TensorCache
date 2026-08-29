@@ -1,0 +1,216 @@
+{
+  "pixel_cache": [
+    {
+      "Format": "Raw uint8 (Uncompressed)",
+      "KB/img": 330.75,
+      "Ratio": 1.0,
+      "PSNR (dB)": "inf",
+      "SSIM": 1.0,
+      "MAE": 0.0,
+      "MaxErr": 0,
+      "Decode (MB/s)": "Zero-Decode (Memory Map)"
+    },
+    {
+      "Format": "JPEG (Quality=95)",
+      "KB/img": 57.214176432291666,
+      "Ratio": 5.7809099182160875,
+      "PSNR (dB)": "40.59",
+      "SSIM": "0.9985",
+      "MAE": "1.78",
+      "MaxErr": 54,
+      "Decode (MB/s)": "19.8 MB/s (CPU)"
+    },
+    {
+      "Format": "JPEG (Quality=85)",
+      "KB/img": 33.369114583333335,
+      "Ratio": 9.91186023752628,
+      "PSNR (dB)": "35.96",
+      "SSIM": "0.9954",
+      "MAE": "3.15",
+      "MaxErr": 73,
+      "Decode (MB/s)": "18.8 MB/s (CPU)"
+    },
+    {
+      "Format": "JPEG (Quality=75)",
+      "KB/img": 25.367669270833332,
+      "Ratio": 13.038249453223607,
+      "PSNR (dB)": "33.91",
+      "SSIM": "0.9925",
+      "MAE": "4.02",
+      "MaxErr": 88,
+      "Decode (MB/s)": "18.7 MB/s (CPU)"
+    },
+    {
+      "Format": "WebP (Q=85)",
+      "KB/img": 28.91912109375,
+      "Ratio": 11.437069575101356,
+      "PSNR (dB)": "37.21",
+      "SSIM": "0.9969",
+      "MAE": "2.68",
+      "MaxErr": 60,
+      "Decode (MB/s)": "8.8 MB/s (CPU)"
+    },
+    {
+      "Format": "WebP (Lossless)",
+      "KB/img": 138.25520833333334,
+      "Ratio": 2.3923149368996044,
+      "PSNR (dB)": "inf",
+      "SSIM": "1.0000",
+      "MAE": "0.00",
+      "MaxErr": 0,
+      "Decode (MB/s)": "1.9 MB/s (CPU)"
+    },
+    {
+      "Format": "Blosc2 + LZ4 (Shuffle, Lossless)",
+      "KB/img": 329.184833984375,
+      "Ratio": 1.0047546723118455,
+      "PSNR (dB)": "inf (Lossless)",
+      "SSIM": 1.0,
+      "MAE": 0.0,
+      "MaxErr": 0,
+      "Decode (MB/s)": "2100.7 MB/s"
+    },
+    {
+      "Format": "Zstandard (Level 1, Lossless)",
+      "KB/img": 300.3429134114583,
+      "Ratio": 1.101241232040941,
+      "PSNR (dB)": "inf (Lossless)",
+      "SSIM": 1.0,
+      "MAE": 0.0,
+      "MaxErr": 0,
+      "Decode (MB/s)": "336.3 MB/s"
+    }
+  ],
+  "feature_cache": [
+    {
+      "Method": "FP32 (Ground Truth)",
+      "Bytes/Elem": 4.0,
+      "Ratio vs FP32": 1.0,
+      "Ratio vs BF16": 0.5,
+      "rel_rmse_pct": 0.0,
+      "mape_pct": 0.0,
+      "psnr_db": Infinity,
+      "cos_sim": 1.006824254989624,
+      "max_err": 0.0,
+      "outlier_err_pct": 0.0,
+      "GPU Decode": "Zero"
+    },
+    {
+      "Method": "Raw BF16 (Standard Float)",
+      "Bytes/Elem": 2.0,
+      "Ratio vs FP32": 2.0,
+      "Ratio vs BF16": 1.0,
+      "rel_rmse_pct": 0.16657840770473434,
+      "mape_pct": 0.14108403120189905,
+      "psnr_db": 76.15074387079358,
+      "cos_sim": 1.006810188293457,
+      "max_err": 0.015616416931152344,
+      "outlier_err_pct": 0.1191273215226829,
+      "GPU Decode": "Zero / 1-cycle"
+    },
+    {
+      "Method": "Raw FP16",
+      "Bytes/Elem": 2.0,
+      "Ratio vs FP32": 2.0,
+      "Ratio vs BF16": 1.0,
+      "rel_rmse_pct": 0.02082960756739668,
+      "mape_pct": 0.017641513841226697,
+      "psnr_db": 94.20920984702788,
+      "cos_sim": 1.0068542957305908,
+      "max_err": 0.0019521713256835938,
+      "outlier_err_pct": 0.014731149713043123,
+      "GPU Decode": "Zero / 1-cycle"
+    },
+    {
+      "Method": "Naive FP8 (E4M3, Global Scale)",
+      "Bytes/Elem": 1.0,
+      "Ratio vs FP32": 4.0,
+      "Ratio vs BF16": 2.0,
+      "rel_rmse_pct": 2.6371411960350475,
+      "mape_pct": 2.2494975477457047,
+      "psnr_db": 52.151891743446754,
+      "cos_sim": 1.0046136379241943,
+      "max_err": 0.193206787109375,
+      "outlier_err_pct": 3.1931810081005096,
+      "GPU Decode": "Instant DMA Cast"
+    },
+    {
+      "Method": "Naive FP8 (E5M2, Global Scale)",
+      "Bytes/Elem": 1.0,
+      "Ratio vs FP32": 4.0,
+      "Ratio vs BF16": 2.0,
+      "rel_rmse_pct": 5.247806437995878,
+      "mape_pct": 4.483777657151222,
+      "psnr_db": 46.175018130747716,
+      "cos_sim": 1.0042779445648193,
+      "max_err": 0.3864128589630127,
+      "outlier_err_pct": 6.812695413827896,
+      "GPU Decode": "Instant DMA Cast"
+    },
+    {
+      "Method": "Smart MXFP8 (Block=32)",
+      "Bytes/Elem": 1.0625,
+      "Ratio vs FP32": 3.764705882352941,
+      "Ratio vs BF16": 1.8823529411764706,
+      "rel_rmse_pct": 2.3892063583806897,
+      "mape_pct": 2.0568614825606346,
+      "psnr_db": 53.00828966906938,
+      "cos_sim": 1.0065028667449951,
+      "max_err": 0.1587977409362793,
+      "outlier_err_pct": 0.1520130899734795,
+      "GPU Decode": "< 0.05 ms (Triton)"
+    },
+    {
+      "Method": "Smart MXFP8 (Block=64)",
+      "Bytes/Elem": 1.03125,
+      "Ratio vs FP32": 3.878787878787879,
+      "Ratio vs BF16": 1.9393939393939394,
+      "rel_rmse_pct": 2.4995944494936797,
+      "mape_pct": 2.146698907017708,
+      "psnr_db": 52.617097075561375,
+      "cos_sim": 1.0065038204193115,
+      "max_err": 0.16696929931640625,
+      "outlier_err_pct": 0.17368125263601542,
+      "GPU Decode": "< 0.05 ms (Triton)"
+    },
+    {
+      "Method": "Outlier-Protected FP8 (0.1% Outliers)",
+      "Bytes/Elem": 1.002228878004134,
+      "Ratio vs FP32": 3.991104315379247,
+      "Ratio vs BF16": 1.9955521576896236,
+      "rel_rmse_pct": 2.655817657165807,
+      "mape_pct": 2.251722663640976,
+      "psnr_db": 52.098948609383356,
+      "cos_sim": 1.0064815282821655,
+      "max_err": 0.12497973442077637,
+      "outlier_err_pct": 1.0957191698253155,
+      "GPU Decode": "Fast Scatter (~0.1 ms)"
+    },
+    {
+      "Method": "Block-wise INT8 (Block=32)",
+      "Bytes/Elem": 1.0625,
+      "Ratio vs FP32": 3.764705882352941,
+      "Ratio vs BF16": 1.8823529411764706,
+      "rel_rmse_pct": 0.543151138164915,
+      "mape_pct": 0.5801706109195948,
+      "psnr_db": 65.8905290556358,
+      "cos_sim": 1.0067516565322876,
+      "max_err": 0.020752251148223877,
+      "outlier_err_pct": 0.11894989293068647,
+      "GPU Decode": "< 0.05 ms (Triton)"
+    },
+    {
+      "Method": "Mantissa-Masked BF16 + ZSTD (Lossless Float)",
+      "Bytes/Elem": 1.1840766028616638,
+      "Ratio vs FP32": 3.3781598169686338,
+      "Ratio vs BF16": 1.6890799084843169,
+      "rel_rmse_pct": 2.3828844328328063,
+      "mape_pct": 1.9695207476615906,
+      "psnr_db": 53.03552737015227,
+      "cos_sim": 1.0043842792510986,
+      "max_err": 0.23436641693115234,
+      "outlier_err_pct": 1.5333982184529305,
+      "GPU Decode": "> 100 GB/s (nvCOMP/ZSTD)"
+    }
+  ]
+}

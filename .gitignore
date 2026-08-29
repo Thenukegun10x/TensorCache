@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+*.whl
+.venv/
+.venv-mdv6/
+.pytest_cache/
+*.egg
+
+# Data / large binaries
+*.tgz
+*.tar
+*.zip
+data/
+*_int8.bin
+*_scales.bin
+*_zp.bin
+*_pixels.bin
+*_meta.json
+*_pixel_meta.json
+!compression_benchmark_results.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Triton cache
+triton_cache/
