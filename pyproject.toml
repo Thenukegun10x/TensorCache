@@ -8,9 +8,9 @@ version = "0.1.0"
 description = "Ultra-fast, high-fidelity block-wise INT8 feature & pixel cache engine for ML pipelines"
 readme = "README.md"
 requires-python = ">=3.9"
-license = "MIT"
+license = {text = "Apache-2.0"}
 authors = [
-    { name = "ML Optimization Team" }
+    { name = "TensorCache Authors" }
 ]
 keywords = ["pytorch", "gpu", "compression", "vit", "cnn", "caching", "int8", "quantization", "triton", "cuda", "rocm"]
 dependencies = [

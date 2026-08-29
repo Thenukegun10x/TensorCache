@@ -1,5 +1,6 @@
 """
 TensorCache: Ultra-fast, high-fidelity block-wise INT8 feature & pixel cache engine for ML.
+Licensed under the Apache License, Version 2.0.
 """
 
 from .codec import (
