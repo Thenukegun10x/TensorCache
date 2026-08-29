@@ -3,8 +3,8 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "tensorcache"
-version = "0.1.0"
+name = "tensor-cache"
+version = "0.2.0"
 description = "Ultra-fast, high-fidelity block-wise INT8 feature & pixel cache engine for ML pipelines"
 readme = "README.md"
 requires-python = ">=3.9"

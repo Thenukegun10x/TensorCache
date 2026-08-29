@@ -21,6 +21,7 @@
 ## 📦 Installation
 
 ```bash
+pip install tensor-cache          # PyPI (import tensorcache)
 pip install -e .          # dev
 pip install -e ".[fast]"  # triton+zstd+blosc2 (Linux)
 ```
