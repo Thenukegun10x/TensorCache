@@ -1,6 +1,8 @@
-# TensorCache ⚡
+# TensorCache ⚡ [![PyPI](https://img.shields.io/pypi/v/tcache?label=tcache)](https://pypi.org/project/tcache/) [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 
 **Ultra-fast, high-fidelity block-wise INT8 feature & pixel cache engine for PyTorch.**
+
+`pip install tcache` → `import tensorcache` or `import tcache` — `0.2.0` on [PyPI](https://pypi.org/project/tcache/).
 
 `tensorcache` eliminates two bottlenecks:
 1. **Feature Cache Bloat:** `AMO-BQ` asymmetric MSE-optimal `G32` `1.09B` `1.83x` vs BF16 `0.47%` `rel RMSE` (`sym 1.06B 0.54%`) — near `G16` floor `0.39%`.
