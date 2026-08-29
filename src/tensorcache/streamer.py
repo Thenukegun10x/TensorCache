@@ -76,18 +76,20 @@ class ZeroCopyTensorStreamer:
         
         # 3. Pre-allocate Pinned CPU Memory Staging Buffers (Fixed ~22-45 MB RAM)
         # amo adds 0.16MB per 5.4M, still ~45MB for batch 128
+        # pin_memory only if CUDA available, else plain (CPU fallback)
+        use_pin = torch.cuda.is_available() and self.device.type in ("cuda", "hip")
         q_dtype = torch.uint8 if self.amo_bq else torch.int8
         self.pinned_int8 = torch.empty(
-            (batch_size, self.seq_len, self.dim), dtype=q_dtype, pin_memory=True
+            (batch_size, self.seq_len, self.dim), dtype=q_dtype, pin_memory=use_pin
         )
         self.pinned_scales = torch.empty(
-            (batch_size, self.scales_per_sample), dtype=torch.bfloat16, pin_memory=True
+            (batch_size, self.scales_per_sample), dtype=torch.bfloat16, pin_memory=use_pin
         )
         self.pinned_int8_np = self.pinned_int8.numpy()
         self.pinned_scales_np = self.pinned_scales.view(torch.int16).numpy().view(np.uint16)
         if self.amo_bq:
             self.pinned_zp = torch.empty(
-                (batch_size, self.scales_per_sample), dtype=torch.uint8, pin_memory=True
+                (batch_size, self.scales_per_sample), dtype=torch.uint8, pin_memory=use_pin
             )
             self.pinned_zp_np = self.pinned_zp.numpy()
         else:

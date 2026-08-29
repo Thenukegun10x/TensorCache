@@ -54,6 +54,15 @@ if HAS_TRITON:
         tl.store(out_ptr + offsets, out_bf16, mask=mask)
 
 
+def _sanitize_blocks(x_blocks: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return (x_clean, is_finite_mask) where non-finite -> 0 for scale calc."""
+    is_finite = torch.isfinite(x_blocks)
+    if not is_finite.all():
+        x_clean = torch.where(is_finite, x_blocks, torch.zeros_like(x_blocks))
+        return x_clean, is_finite
+    return x_blocks, is_finite
+
+
 def quantize_int8_g32(
     x: torch.Tensor,
     group_size: int = 32
@@ -79,14 +88,18 @@ def quantize_int8_g32(
         x_flat = F.pad(x_flat, (0, pad_len))
         
     x_blocks = x_flat.view(-1, group_size)
-    block_max = x_blocks.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
+    x_clean, is_finite = _sanitize_blocks(x_blocks)
+    block_max = x_clean.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
     
     # 16-bit Scale Factor (2 bytes per group)
     scales = (block_max / 127.0).squeeze(-1).to(torch.bfloat16)
     
-    # Symmetrically quantize
-    scaled = x_blocks / (scales.unsqueeze(-1).float())
+    # Symmetrically quantize (preserve NaN/Inf as 0, avoid block corruption)
+    scaled = x_clean / (scales.unsqueeze(-1).float())
     q_blocks = torch.round(scaled).clamp(-128, 127).to(torch.int8)
+    # Zero out entries that were non-finite (cannot represent NaN in INT8)
+    if not is_finite.all():
+        q_blocks = torch.where(is_finite.view_as(q_blocks), q_blocks, torch.zeros_like(q_blocks))
     q_int8 = q_blocks.flatten()[:numel]
     
     return q_int8, scales, orig_shape
@@ -118,7 +131,8 @@ def quantize_int8_adaptive(
         x_flat = F.pad(x_flat, (0, pad_len))
         
     x_blocks = x_flat.view(-1, group_size)
-    b_max = x_blocks.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
+    x_clean, is_finite = _sanitize_blocks(x_blocks)
+    b_max = x_clean.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
     s0 = b_max / 127.0  # [M, 1]
 
     # Evaluate candidates in parallel: [0.90, ..., 1.05]
@@ -136,9 +150,11 @@ def quantize_int8_adaptive(
     best_scales = torch.gather(cand_scales, 1, best_idx).squeeze(-1).to(torch.bfloat16)
 
     q_blocks = torch.clamp(
-        torch.round(x_blocks / (best_scales.unsqueeze(-1).float())), 
+        torch.round(x_clean / (best_scales.unsqueeze(-1).float())), 
         -128, 127
     ).to(torch.int8)
+    if not is_finite.all():
+        q_blocks = torch.where(is_finite.view_as(q_blocks), q_blocks, torch.zeros_like(q_blocks))
     
     return q_blocks.flatten()[:numel], best_scales, orig_shape
 
@@ -260,7 +276,8 @@ def quantize_int8_amo_bq(
         num_candidates, lo, hi = _resolve_amo_preset(mode, None, None, None)
 
     # Try fused Triton single-pass quant for GPU (offline but much faster)
-    if HAS_TRITON and x.is_cuda and x.device.type in ("cuda", "hip"):
+    # Skip fused for NaN/Inf (Triton min/max would propagate NaN)
+    if HAS_TRITON and x.is_cuda and x.device.type in ("cuda", "hip") and torch.isfinite(x).all():
         try:
             from .fused_ops import quantize_amo_fused_gpu
             return quantize_amo_fused_gpu(x, group_size=group_size, mode=mode, num_candidates=num_candidates, lo=lo, hi=hi)
@@ -276,11 +293,15 @@ def quantize_int8_amo_bq(
     x_blocks = x_flat.view(-1, group_size)  # [M,G]
     num_blocks = x_blocks.shape[0]
 
-    b_min = x_blocks.amin(dim=-1, keepdim=True)  # [M,1]
-    b_max = x_blocks.amax(dim=-1, keepdim=True)  # [M,1]
-    # Avoid degenerate zero-range blocks
+    x_clean, is_finite = _sanitize_blocks(x_blocks)
+    # Use clean for stats; keep original for error calc but mask NaNs
+    b_min = x_clean.amin(dim=-1, keepdim=True)  # [M,1]
+    b_max = x_clean.amax(dim=-1, keepdim=True)  # [M,1]
+    # If block all non-finite, set range 1e-8
     b_range = (b_max - b_min).clamp(min=1e-8)  # [M,1]
+    b_range = torch.where(torch.isfinite(b_range), b_range, torch.ones_like(b_range)*1e-8)
     s0 = b_range / 255.0  # [M,1]
+    s0 = torch.where(torch.isfinite(s0), s0, torch.ones_like(s0)* (1e-8/255.0))
 
     multipliers = torch.linspace(lo, hi, num_candidates, device=x.device, dtype=torch.float32)  # [C]
 
@@ -291,7 +312,9 @@ def quantize_int8_amo_bq(
 
     for start in range(0, num_blocks, chunk):
         end = min(start + chunk, num_blocks)
-        xb_c = x_blocks[start:end]  # [Bc,G]
+        xb_c = x_blocks[start:end]  # [Bc,G] original (with NaN)
+        xb_clean_c = x_clean[start:end]  # [Bc,G] sanitized
+        is_finite_c = is_finite[start:end]  # [Bc,G]
         s0_c = s0[start:end]  # [Bc,1]
         b_min_c = b_min[start:end]  # [Bc,1]
 
@@ -300,20 +323,25 @@ def quantize_int8_amo_bq(
         # zp per candidate: [Bc,C,1]
         cand_zps = torch.clamp(torch.round(-b_min_c.unsqueeze(1) / cand_scales), 0, 255)
 
-        # Quant candidates: [Bc,C,G]
-        cand_q = torch.clamp(torch.round(xb_c.unsqueeze(1) / cand_scales + cand_zps), 0, 255)
+        # Quant candidates: [Bc,C,G] using clean
+        cand_q = torch.clamp(torch.round(xb_clean_c.unsqueeze(1) / cand_scales + cand_zps), 0, 255)
         cand_rec = (cand_q - cand_zps) * cand_scales  # [Bc,C,G]
-        cand_err = ((xb_c.unsqueeze(1) - cand_rec) ** 2).sum(dim=-1)  # [Bc,C]
+        # Mask out non-finite positions for error (0 diff)
+        diff = torch.where(is_finite_c.unsqueeze(1), xb_clean_c.unsqueeze(1) - cand_rec, torch.zeros_like(cand_rec))
+        cand_err = (diff ** 2).sum(dim=-1)  # [Bc,C]
 
         best_idx = cand_err.argmin(dim=-1)  # [Bc]
         arange = torch.arange(end - start, device=x.device)
         best_scales[start:end] = cand_scales[arange, best_idx].squeeze(-1)
         best_zps[start:end] = cand_zps[arange, best_idx].squeeze(-1)
 
-    # Final quant with best params
+    # Final quant with best params (use clean, then mask)
     best_scales_f = best_scales.unsqueeze(-1)  # [M,1]
     best_zps_f = best_zps.unsqueeze(-1)  # [M,1]
-    q_blocks = torch.clamp(torch.round(x_blocks / best_scales_f + best_zps_f), 0, 255).to(torch.uint8)
+    q_blocks = torch.clamp(torch.round(x_clean / best_scales_f + best_zps_f), 0, 255).to(torch.uint8)
+    # For non-finite, set q = zp so rec = 0
+    if not is_finite.all():
+        q_blocks = torch.where(is_finite.view_as(q_blocks), q_blocks, best_zps_f.expand_as(q_blocks).to(torch.uint8))
     q_flat = q_blocks.flatten()[:numel]
 
     return q_flat, best_scales.to(torch.bfloat16), best_zps.to(torch.uint8), orig_shape
