@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "tensor-cache"
+name = "tcache"
 version = "0.2.0"
 description = "Ultra-fast, high-fidelity block-wise INT8 feature & pixel cache engine for ML pipelines"
 readme = "README.md"
@@ -35,4 +35,4 @@ dev = [
 tensorcache = "tensorcache.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/tensorcache"]
+packages = ["src/tensorcache", "src/tcache"]
