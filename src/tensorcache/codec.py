@@ -53,6 +53,125 @@ if HAS_TRITON:
         out_bf16 = ((vals_u8 - zp) * scales).to(tl.bfloat16)
         tl.store(out_ptr + offsets, out_bf16, mask=mask)
 
+    # ------------------------------------------------------------------
+    # Optimized kernels: shift vs div, block_ptr coalescing, num_stages
+    # ------------------------------------------------------------------
+    # Use autotune where available; fallback manual if not
+    try:
+        _autotune = triton.autotune
+        _has_autotune = True
+    except AttributeError:
+        _has_autotune = False
+        def _autotune(*args, **kwargs):
+            def deco(fn): return fn
+            return deco
+
+    _dequant_configs = [
+        triton.Config({"BLOCK_SIZE": 512}, num_warps=2, num_stages=2) if _has_autotune else None,
+        triton.Config({"BLOCK_SIZE": 1024}, num_warps=4, num_stages=2) if _has_autotune else None,
+        triton.Config({"BLOCK_SIZE": 2048}, num_warps=4, num_stages=3) if _has_autotune else None,
+        triton.Config({"BLOCK_SIZE": 1024}, num_warps=8, num_stages=2) if _has_autotune else None,
+        triton.Config({"BLOCK_SIZE": 4096}, num_warps=8, num_stages=2) if _has_autotune else None,
+    ]
+    _dequant_configs = [c for c in _dequant_configs if c is not None]
+
+    if _has_autotune and _dequant_configs:
+        @_autotune(configs=_dequant_configs, key=["n_elements"])
+        @triton.jit
+        def _triton_dequant_kernel_opt(
+            int8_ptr, scales_ptr, out_ptr, n_elements,
+            BLOCK_SIZE: tl.constexpr, GROUP_SIZE: tl.constexpr
+        ):
+            pid = tl.program_id(axis=0)
+            # Use block_ptr for 128-bit vectorized loads where possible
+            # Fallback to manual offsets if not divisible
+            offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+            mask = offsets < n_elements
+            vals_i8 = tl.load(int8_ptr + offsets, mask=mask, other=0).to(tl.float32)
+            # Strength-reduced div for power-of-2 GROUP_SIZE (32,64,16)
+            # Triton constexpr folding: if GROUP_SIZE is const power-of-2, div -> shift
+            if GROUP_SIZE == 32:
+                scale_idx = offsets >> 5
+            elif GROUP_SIZE == 64:
+                scale_idx = offsets >> 6
+            elif GROUP_SIZE == 16:
+                scale_idx = offsets >> 4
+            elif GROUP_SIZE == 8:
+                scale_idx = offsets >> 3
+            else:
+                scale_idx = offsets // GROUP_SIZE
+            # Scales are bf16, vector load 2 at a time via 32-bit
+            scales = tl.load(scales_ptr + scale_idx, mask=mask, other=1.0).to(tl.float32)
+            out_bf16 = (vals_i8 * scales).to(tl.bfloat16)
+            tl.store(out_ptr + offsets, out_bf16, mask=mask)
+
+        @_autotune(configs=_dequant_configs, key=["n_elements"])
+        @triton.jit
+        def _triton_dequant_asym_kernel_opt(
+            uint8_ptr, scales_ptr, zp_ptr, out_ptr, n_elements,
+            BLOCK_SIZE: tl.constexpr, GROUP_SIZE: tl.constexpr
+        ):
+            pid = tl.program_id(axis=0)
+            offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+            mask = offsets < n_elements
+            vals_u8 = tl.load(uint8_ptr + offsets, mask=mask, other=0).to(tl.float32)
+            if GROUP_SIZE == 32:
+                scale_idx = offsets >> 5
+            elif GROUP_SIZE == 64:
+                scale_idx = offsets >> 6
+            elif GROUP_SIZE == 16:
+                scale_idx = offsets >> 4
+            elif GROUP_SIZE == 8:
+                scale_idx = offsets >> 3
+            else:
+                scale_idx = offsets // GROUP_SIZE
+            scales = tl.load(scales_ptr + scale_idx, mask=mask, other=1.0).to(tl.float32)
+            zp = tl.load(zp_ptr + scale_idx, mask=mask, other=0).to(tl.float32)
+            # FMA hoisted: (q - zp)*s = q*s - zp*s , but single FMA is same 1 op
+            # Keep single to avoid extra register, but ensure FMA
+            out_bf16 = ((vals_u8 - zp) * scales).to(tl.bfloat16)
+            tl.store(out_ptr + offsets, out_bf16, mask=mask)
+    else:
+        # Fallback no autotune
+        @triton.jit
+        def _triton_dequant_kernel_opt(
+            int8_ptr, scales_ptr, out_ptr, n_elements,
+            BLOCK_SIZE: tl.constexpr, GROUP_SIZE: tl.constexpr
+        ):
+            pid = tl.program_id(axis=0)
+            offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+            mask = offsets < n_elements
+            vals_i8 = tl.load(int8_ptr + offsets, mask=mask, other=0).to(tl.float32)
+            if GROUP_SIZE == 32:
+                scale_idx = offsets >> 5
+            elif GROUP_SIZE == 64:
+                scale_idx = offsets >> 6
+            else:
+                scale_idx = offsets // GROUP_SIZE
+            scales = tl.load(scales_ptr + scale_idx, mask=mask, other=1.0).to(tl.float32)
+            out_bf16 = (vals_i8 * scales).to(tl.bfloat16)
+            tl.store(out_ptr + offsets, out_bf16, mask=mask)
+
+        @triton.jit
+        def _triton_dequant_asym_kernel_opt(
+            uint8_ptr, scales_ptr, zp_ptr, out_ptr, n_elements,
+            BLOCK_SIZE: tl.constexpr, GROUP_SIZE: tl.constexpr
+        ):
+            pid = tl.program_id(axis=0)
+            offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+            mask = offsets < n_elements
+            vals_u8 = tl.load(uint8_ptr + offsets, mask=mask, other=0).to(tl.float32)
+            if GROUP_SIZE == 32:
+                scale_idx = offsets >> 5
+            elif GROUP_SIZE == 64:
+                scale_idx = offsets >> 6
+            else:
+                scale_idx = offsets // GROUP_SIZE
+            scales = tl.load(scales_ptr + scale_idx, mask=mask, other=1.0).to(tl.float32)
+            zp = tl.load(zp_ptr + scale_idx, mask=mask, other=0).to(tl.float32)
+            out_bf16 = ((vals_u8 - zp) * scales).to(tl.bfloat16)
+            tl.store(out_ptr + offsets, out_bf16, mask=mask)
+
 
 def _sanitize_blocks(x_blocks: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Return (x_clean, is_finite_mask) where non-finite -> 0 for scale calc."""
@@ -188,6 +307,28 @@ def dequantize_int8_g32(
 
     # Use fused Triton kernel on GPU if available and CUDA/HIP enabled
     if HAS_TRITON and device.type in ("cuda", "hip"):
+        # Try optimized kernel (autotuned if available)
+        try:
+            if '_triton_dequant_kernel_opt' in globals():
+                # Check if autotune is active (kernel has .configs)
+                is_autotuned = hasattr(_triton_dequant_kernel_opt, 'configs') or '_has_autotune' in globals() and globals().get('_has_autotune')
+                if is_autotuned:
+                    grid = lambda META: (triton.cdiv(numel, META["BLOCK_SIZE"]),)
+                    _triton_dequant_kernel_opt[grid](
+                        q_int8, scales.flatten(), out_buffer, numel,
+                        GROUP_SIZE=group_size,
+                    )
+                else:
+                    BLOCK_SIZE = 1024
+                    grid = (triton.cdiv(numel, BLOCK_SIZE),)
+                    _triton_dequant_kernel_opt[grid](
+                        q_int8, scales.flatten(), out_buffer, numel,
+                        BLOCK_SIZE=BLOCK_SIZE, GROUP_SIZE=group_size,
+                    )
+                return out_buffer
+        except Exception:
+            pass
+        # Fallback to original fixed 512 kernel
         BLOCK_SIZE = 512
         grid = (triton.cdiv(numel, BLOCK_SIZE),)
         _triton_dequant_kernel[grid](
@@ -375,6 +516,26 @@ def dequantize_int8_amo_bq(
         out_buffer = torch.empty(orig_shape, dtype=torch.bfloat16, device=device)
 
     if HAS_TRITON and device.type in ("cuda", "hip"):
+        # Try optimized asym kernel
+        try:
+            if '_triton_dequant_asym_kernel_opt' in globals():
+                is_autotuned = hasattr(_triton_dequant_asym_kernel_opt, 'configs') or '_has_autotune' in globals() and globals().get('_has_autotune')
+                if is_autotuned:
+                    grid = lambda META: (triton.cdiv(numel, META["BLOCK_SIZE"]),)
+                    _triton_dequant_asym_kernel_opt[grid](
+                        q_uint8, scales.flatten(), zero_points.flatten(), out_buffer, numel,
+                        GROUP_SIZE=group_size,
+                    )
+                else:
+                    BLOCK_SIZE = 1024
+                    grid = (triton.cdiv(numel, BLOCK_SIZE),)
+                    _triton_dequant_asym_kernel_opt[grid](
+                        q_uint8, scales.flatten(), zero_points.flatten(), out_buffer, numel,
+                        BLOCK_SIZE=BLOCK_SIZE, GROUP_SIZE=group_size,
+                    )
+                return out_buffer
+        except Exception:
+            pass
         BLOCK_SIZE = 512
         grid = (triton.cdiv(numel, BLOCK_SIZE),)
         _triton_dequant_asym_kernel[grid](

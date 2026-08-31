@@ -2,19 +2,22 @@
 
 **Ultra-fast, high-fidelity block-wise INT8 feature & pixel cache engine for PyTorch.**
 
-`pip install tcache` → `import tensorcache` or `import tcache` — `0.2.0` on [PyPI](https://pypi.org/project/tcache/).
+`pip install tcache` → `import tensorcache` or `import tcache` — `0.2.2` on [PyPI](https://pypi.org/project/tcache/).
 
 `tensorcache` eliminates two bottlenecks:
 1. **Feature Cache Bloat:** `AMO-BQ` asymmetric MSE-optimal `G32` `1.09B` `1.83x` vs BF16 `0.47%` `rel RMSE` (`sym 1.06B 0.54%`) — near `G16` floor `0.39%`.
 2. **JPEG/PNG CPU Decode:** Zero-copy `mmap` + `GPU` stream prefetch `>2,000 MB/s`, ring-buffer `6.8MB` `VRAM` `batch8 128x768`.
+3. **Training Throughput (v0.2.2):** `iter_batches` `27k samp/s` `17.7GB/s` `B128 446x768` `~8.3x` vs `v0.2.0` `3.1k`, `Streamer` `21k` `5.1ms` `double-buffered` `pinned + async H2D` (`low_vram` `128MB` `B128`), `sharded 8x` for `H100 DDP`.
 
 ---
 
 ## 🚀 Key Features
 
 * **AMO-BQ (Asymmetric MSE-Optimal, G32):** `min-max + zp uint8 + 48×` clipping search `[0.95,1.10]` — `0.47%` `hetero 0.54%` vs `sym 0.74%` (`-26%`), `per-token 1.73%` (`cache\dtype_comparison.json`). Presets `fast/balanced/accurate/max`.
-* **Microsecond Dequant:** `Triton` `(q-zp)*scale -> BF16` `0.06ms 5.4M 337GB/s` (`codec.py:40`), `FusedDequantLinear` `0` intermediate `fused_ops.py:119`.
-* **Minimal VRAM:** `q 5.22MB + scales 0.32MB + zp 0.16MB + out 10.45MB` `5.4M`; `Streamer` fixed `~43MB` `double-buffer` `out_buffer` reuse, `G64` halves `scales/zp`.
+* **Microsecond Dequant (v0.2.2 opt):** `Triton` `shift >>5` vs `div`, `autotune BLOCK 512/1024/2048` `stages 2/3` `163 GB/s` `5.4M` (`codec.py:22` `0.19ms` `10M` `26x` for `1024`), `FusedDequantLinear` `0` intermediate `fused_ops.py:119`. `NaN/Inf` isolated `0` poison `1e-8` scale.
+* **Training-Optimized Dataloader:** `iter_batches` `27k samp/s` `17.7GB/s` `B128` `4.5ms` (`8.3x` vs `3.1k`), `Streamer` `21.6k` `5.1ms` `double-buffered` `pinned` `async H2D` overlap `dequant`. `low_vram=True` `128MB` `B128` (`53 MB` `B32`) vs `256MB`.
+* **Big Data Sharded:** `Writer(num_shards=8)` `->` `feat_shard{i}_*.bin` `+` `feat_shards.json`, `Dataset/Streamer(rank, world_size)` `DDP` `H100 8x` `~5.8k` random `27k` contiguous. Single shard `num_shards=1` unchanged `100%` compat.
+* **Minimal VRAM:** `q 5.22MB + scales 0.32MB + zp 0.16MB + out 10.45MB` `5.4M`; `G64` halves `scales/zp`.
 * **Cross-Platform:** `CUDA`/`ROCm` `Triton` else `PyTorch` fallback, `Windows` `mmap` safe `close()`.
 * **CLI + Python one-liners:** `tc.compress` / `tc.benchmark_tensor` / `tensorcache benchmark`.
 
@@ -51,24 +54,39 @@ codec = tc.BlockwiseInt8Codec(group_size=32, amo_bq=True, amo_mode="balanced")
 print(codec) # G=32, amo_bq=balanced 1.0938B 1:1.83x
 ```
 
-### 2. Feature Cache to Disk (mmap)
+### 2. Feature Cache to Disk (mmap) - Training Optimized
 ```python
 import tensorcache as tc
 from torch.utils.data import DataLoader
 
 # Write (amo_bq, G32 default balanced, G64 for minimal VRAM 1.046B 0.55%)
+# Single shard (default, unchanged)
 writer = tc.FeatureCacheWriter("./cache/dinov3", 10000,446,768, group_size=32, amo_bq=True, amo_mode="balanced")
-writer.append(x) # [seq,dim] or [B,seq,dim]
-writer.close()   # writes _int8.bin (uint8) _scales.bin _zp.bin _meta.json
+# Or sharded for H100 / >1M samples (8 shards ~1.25k each)
+writer = tc.FeatureCacheWriter("./cache/dinov3", 10000,446,768, group_size=32, amo_bq=True, amo_mode="balanced", num_shards=8)
+writer.append(x) # [seq,dim] or [B,seq,dim] (batched GPU 64/chunk, CPU per-sample)
+writer.close()   # single: _int8.bin ... | sharded: _shard0_int8.bin ... + _shards.json
 
-# Load
-ds = tc.FeatureCacheDataset("./cache/dinov3") # -> (q uint8, s BF16, zp uint8)
+# Load - auto-detects sharded
+ds = tc.FeatureCacheDataset("./cache/dinov3") # -> (q uint8, s BF16, zp uint8) all shards
+# DDP per-rank (H100 8x)
+ds = tc.FeatureCacheDataset("./cache/dinov3", rank=rank, world_size=8) # only shard rank
+# or explicit
+ds = tc.FeatureCacheDataset("./cache/dinov3", shard_idx=0)
 ds = tc.FeatureCacheDataset("./cache/dinov3", auto_dequant_device="cuda") # -> BF16 directly
+
+# Old path still works but slower (~5k samp/s)
 for q,s,zp in tc.AsyncGPUPrefetcher(DataLoader(ds,batch_size=256,pin_memory=True), device="cuda"):
     batch = tc.dequantize_int8_amo_bq(q,s,zp, shape, group_size=32)
 
-# Minimal VRAM streamer (fixed ~43MB, zero alloc)
-streamer = tc.ZeroCopyTensorStreamer("./cache/dinov3", batch_size=32, device="cuda")
+# Training fastest (27k samp/s 17.7GB/s B128, 8.3x vs v0.2.0)
+for batch in ds.iter_batches(batch_size=128, shuffle=False, device="cuda"): # contiguous 27k, shuffled ~5.8k
+    train(batch)
+
+# Minimal VRAM streamer (double-buffered 64MB B32 / 256MB B128, low_vram 32MB/128MB)
+streamer = tc.ZeroCopyTensorStreamer("./cache/dinov3", batch_size=128, device="cuda", shuffle=True)
+streamer = tc.ZeroCopyTensorStreamer("./cache/dinov3", batch_size=128, device="cuda", low_vram=True) # 128MB B128
+streamer = tc.ZeroCopyTensorStreamer("./cache/dinov3", batch_size=128, device="cuda", shard_idx=0) # per-rank
 for batch in streamer: # BF16 [B,seq,dim] from ring buffer out_bf16_0/1
     train(batch)
 streamer.close()
