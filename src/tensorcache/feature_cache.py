@@ -37,6 +37,7 @@ class FeatureCacheWriter:
         amo_candidates: int = 32,
         amo_mode: Optional[str] = None,
         num_shards: int = 1,
+        quant_bits: int = 8,
     ):
         self.output_prefix = Path(output_prefix)
         self.output_prefix.parent.mkdir(parents=True, exist_ok=True)
@@ -49,11 +50,16 @@ class FeatureCacheWriter:
             raise ValueError(f"amo_mode {amo_mode!r} unknown")
         if adaptive and amo_bq:
             raise ValueError("Pick one: adaptive or amo_bq")
+        if quant_bits in (2, 3, 4):
+            raise ValueError(f"Feature caches with {quant_bits}-bit are not supported: >2% RMSE (INT4 12%, INT3 28% vs INT8 0.7%) would collapse training. Use PixelCache for INT4/INT3 (PSNR 37/31dB) or INT8/INT7 for features.")
+        if quant_bits not in (8,):
+            raise ValueError(f"quant_bits must be 8 for features, got {quant_bits}")
         self.dim = dim
         self.group_size = group_size
         self.adaptive = adaptive
         self.amo_bq = amo_bq
         self.amo_mode = amo_mode
+        self.quant_bits = quant_bits
         # Resolve preset for meta storage
         if amo_mode is not None:
             from .codec import AMO_BQ_PRESETS

@@ -31,7 +31,14 @@ def cmd_info(args):
     for k,(N,lo,hi,desc) in AMO_BQ_PRESETS.items():
         print(f"  {k:8s} N={N:2d} [{lo:.2f},{hi:.2f}]  {desc}")
     print("\nSym G32 1.0625 B 1.88x vs BF16 0.54%, G16 1.1875 B 0.39%")
+    print("\nQuant guidance:")
+    print("  Features (fragile, need <2% RMSE): INT8 G32 0.70% 1.88x or AMO 0.47% 1.83x, INT7 G32 1.35% 2.13x max sub-2%")
+    print("    INT4/INT3 for features blocked (12%/28% >>2% collapse) -> use INT8/INT7 only")
+    print("  Pixels (robust, PSNR>30dB): raw 1B 1.0x, INT4 G32 0.5B 2x PSNR 37dB, INT3 0.375B 2.29x PSNR 31dB")
+    print("    PixelCacheWriter(..., quant='int4'/'int3'/'raw') or quant_bits=4/3/8, group_size=32")
+    print("  Second stage (lossless on q): RLE+4b+outlier 1.45x boring 5.33x const, 1.0x diverse fallback")
     print("\nTry: tensorcache benchmark --shape 16,446,768 --device cuda")
+    print("     tensorcache cache-info --prefix ./cache/pixels  # auto-detects raw/int4/int3")
 
 def cmd_benchmark(args):
     shape=_parse_shape(args.shape)
@@ -49,21 +56,38 @@ def cmd_benchmark(args):
 
 def cmd_cache_info(args):
     prefix=Path(args.prefix)
-    meta_path=Path(str(prefix)+"_meta.json")
-    if not meta_path.exists():
-        print(f"Meta not found: {meta_path}")
-        sys.exit(1)
+    # Try feature meta, then pixel meta, then shards
+    candidates = [Path(str(prefix)+"_meta.json"), Path(str(prefix)+"_pixel_meta.json"), Path(str(prefix)+"_shards.json")]
+    meta_path = next((p for p in candidates if p.exists()), None)
+    if meta_path is None:
+        # Try pixel meta without suffix
+        alt = Path(str(prefix)+"_pixel_meta.json")
+        if alt.exists():
+            meta_path=alt
+        else:
+            print(f"Meta not found: tried {candidates}")
+            sys.exit(1)
     meta=json.loads(meta_path.read_text())
+    print(f"# {meta_path}")
     print(json.dumps(meta, indent=2))
+    # Show quant info if present
+    if "quant" in meta:
+        print(f"\nQuant: {meta['quant']} bits={meta.get('quant_bits')} group_size={meta.get('group_size')}")
+    if "quant_bits" in meta:
+        print(f"Quant bits: {meta['quant_bits']}")
     # estimate files
-    for key in ["int8_file","scales_file","zp_file"]:
+    for key in ["int8_file","scales_file","zp_file","bin_file","q_file","scales_file"]:
         fname=meta.get(key)
         if fname:
-            fpath=prefix.parent / fname if (prefix.parent / fname).exists() else Path(str(prefix).rsplit("_",1)[0]+f"_{key.split('_')[0]}.bin") if False else None
-            # try direct
-            cand=Path(str(prefix)+"_int8.bin") if key=="int8_file" else Path(str(prefix)+"_scales.bin") if key=="scales_file" else Path(str(prefix)+"_zp.bin")
-            if cand.exists():
-                print(f"{key}: {cand.stat().st_size/1024/1024:.2f} MB")
+            for cand in [prefix.parent / fname, Path(str(prefix)+"_int8.bin"), Path(str(prefix)+"_scales.bin"), Path(str(prefix)+"_zp.bin"), Path(str(prefix)+"_pixels.bin"), Path(str(prefix)+f"_pixels_int{meta.get('quant_bits')}.bin")]:
+                if cand.exists():
+                    print(f"{key}: {cand} {cand.stat().st_size/1024/1024:.2f} MB")
+                    break
+    # Also direct check for pixel quant files
+    for suffix in ["_pixels.bin", "_pixels_int4.bin", "_pixels_int3.bin", "_pixels_int4_scales.bin", "_pixels_int3_scales.bin", "_int8.bin", "_scales.bin", "_zp.bin"]:
+        p = Path(str(prefix)+suffix)
+        if p.exists():
+            print(f"{p.name}: {p.stat().st_size/1024/1024:.2f} MB")
 
 def cmd_compress_demo(args):
     print("Demo compress/decompress (synthetic):")
@@ -78,28 +102,43 @@ def cmd_compress_demo(args):
     print(f"mode={args.mode} G={args.group_size} shape={shape} rel={rel:.4f}% q={q.dtype} s={s.dtype} zp={zp.dtype if zp is not None else None}")
 
 def build_parser():
-    p=argparse.ArgumentParser(prog="tensorcache", description="TensorCache — ultra-fast INT8 feature cache (AMO-BQ)")
+    p=argparse.ArgumentParser(
+        prog="tensorcache",
+        description="TensorCache — ultra-fast INT8 feature & pixel cache (AMO-BQ, INT4/INT3 pixel)",
+        epilog="Examples:\n"
+               "  tensorcache info\n"
+               "  tensorcache benchmark --shape 16,446,768 --device cuda --group-size 32\n"
+               "  tensorcache compress-demo --shape 4,197,768 --mode balanced --device cuda\n"
+               "  tensorcache cache-info --prefix ./cache/dinov3\n"
+               "  python -c \"from tensorcache import PixelCacheWriter; w=PixelCacheWriter('./cache/pixels',1000,224,224,3,quant='int4')\"\n"
+               "  # Feature caches: INT8 only (INT4/INT3 guarded: >2%% RMSE collapse, use PixelCache for INT4/INT3)\n",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     p.add_argument("--version", action="version", version=__version__)
-    sub=p.add_subparsers(dest="cmd", required=True)
+    sub=p.add_subparsers(dest="cmd", required=True, metavar="<command>")
 
-    pi=sub.add_parser("info", help="show version, device, presets")
+    pi=sub.add_parser("info", help="show version, device, presets, and quant notes")
+    pi.description = "Show version, CUDA/Triton, AMO-BQ presets, and quant guidance (INT8 for features, INT4/INT3 for pixels)."
     pi.set_defaults(func=cmd_info)
 
-    pb=sub.add_parser("benchmark", help="bench synthetic tensor")
-    pb.add_argument("--shape", default="16,446,768", help="comma shape e.g. 16,446,768")
-    pb.add_argument("--device", default="cuda", choices=["cuda","cpu"], help="device")
-    pb.add_argument("--group-size", type=int, default=32, dest="group_size")
+    pb=sub.add_parser("benchmark", help="bench synthetic tensor (INT8/AMO-BQ)")
+    pb.description = "Benchmark synthetic BF16 tensor through Blockwise INT8 encode/decode and report RMSE/BW."
+    pb.add_argument("--shape", default="16,446,768", help="comma shape e.g. 16,446,768 (default: %(default)s)")
+    pb.add_argument("--device", default="cuda", choices=["cuda","cpu"], help="device for bench (default: %(default)s)")
+    pb.add_argument("--group-size", type=int, default=32, dest="group_size", help="group size G (default: %(default)s) - 32 for 1.88x 0.70%%, 16 for 0.39%%")
     pb.set_defaults(func=cmd_benchmark)
 
-    pc=sub.add_parser("cache-info", help="inspect cache prefix meta")
-    pc.add_argument("--prefix", required=True, help="cache prefix e.g. ./cache/feat")
+    pc=sub.add_parser("cache-info", help="inspect cache prefix meta (_meta.json / _pixel_meta.json)")
+    pc.description = "Inspect feature or pixel cache meta and file sizes. Supports raw, int4, int3 pixel caches and int8 feature caches."
+    pc.add_argument("--prefix", required=True, help="cache prefix e.g. ./cache/dinov3 or ./cache/pixels")
     pc.set_defaults(func=cmd_cache_info)
 
-    pd=sub.add_parser("compress-demo", help="demo AMO-BQ compress")
-    pd.add_argument("--shape", default="4,197,768")
-    pd.add_argument("--device", default="cuda", choices=["cuda","cpu"])
-    pd.add_argument("--mode", default="balanced", choices=list(AMO_BQ_PRESETS.keys())+["sym","adaptive"])
-    pd.add_argument("--group-size", type=int, default=32, dest="group_size")
+    pd=sub.add_parser("compress-demo", help="demo AMO-BQ compress on synthetic data")
+    pd.description = "Demo compress/decompress with AMO-BQ presets (fast/balanced/accurate/max) or sym/adaptive."
+    pd.add_argument("--shape", default="4,197,768", help="tensor shape (default: %(default)s)")
+    pd.add_argument("--device", default="cuda", choices=["cuda","cpu"], help="device")
+    pd.add_argument("--mode", default="balanced", choices=list(AMO_BQ_PRESETS.keys())+["sym","adaptive"], help="AMO preset or sym/adaptive (default: %(default)s)")
+    pd.add_argument("--group-size", type=int, default=32, dest="group_size", help="group size (default: %(default)s)")
     pd.set_defaults(func=cmd_compress_demo)
 
     return p
