@@ -9,6 +9,7 @@ from pathlib import Path
 import tempfile
 import os
 
+import math
 from tensorcache.codec import (
     BlockwiseInt8Codec,
     quantize_int8_g32,
@@ -18,6 +19,8 @@ from tensorcache.codec import (
     dequantize_int4_g32,
     quantize_int3_g32,
     dequantize_int3_g32,
+    quantize_pixel_wavelet8x,
+    dequantize_pixel_wavelet8x,
 )
 from tensorcache.feature_cache import FeatureCacheWriter, FeatureCacheDataset
 from tensorcache.pixel_cache import PixelCacheWriter, PixelCacheDataset
@@ -172,6 +175,27 @@ def test_pixel_cache_quantized_disk_io():
         print("[+] PixelCache INT4/INT3 disk I/O test passed!")
 
 
+def test_wavelet_8x_codec():
+    torch.manual_seed(42)
+    H, W, C = 64, 64, 3
+    # Natural image proxy with spatial correlation
+    raw = torch.randint(0, 256, (H, W, C), dtype=torch.float32).permute(2, 0, 1).unsqueeze(0)
+    img = torch.nn.functional.avg_pool2d(raw, kernel_size=3, stride=1, padding=1).squeeze(0).permute(1, 2, 0).byte()
+    
+    packed_meta, shape = quantize_pixel_wavelet8x(img, q_scale=1.0)
+    rec = dequantize_pixel_wavelet8x(packed_meta, device="cpu")
+    
+    assert rec.shape == (H, W, C)
+    assert rec.dtype == torch.uint8
+    diff = img.float() - rec.float()
+    mse = (diff ** 2).mean().item()
+    psnr = 20 * math.log10(255.0 / math.sqrt(mse)) if mse > 0 else float('inf')
+    rmse = (math.sqrt(mse) / 255.0) * 100.0
+    
+    assert psnr > 35.0
+    print(f"[+] 8x Wavelet Codec Verified! PSNR: {psnr:.2f} dB, Rel RMSE: {rmse:.2f}%")
+
+
 if __name__ == "__main__":
     test_quantize_dequantize_roundtrip()
     test_adaptive_quantize_roundtrip()
@@ -179,4 +203,6 @@ if __name__ == "__main__":
     test_pixel_cache_disk_io()
     test_int4_int3_roundtrip()
     test_pixel_cache_quantized_disk_io()
+    test_wavelet_8x_codec()
+
     print("\n[+] ALL UNIT TESTS PASSED SUCCESSFULLY!")

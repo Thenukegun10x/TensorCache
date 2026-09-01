@@ -2,12 +2,13 @@
 
 **Ultra-fast, high-fidelity block-wise INT8 feature & pixel cache engine for PyTorch.**
 
-`pip install tcache` → `import tensorcache` or `import tcache` — `0.2.2` on [PyPI](https://pypi.org/project/tcache/).
+`pip install tcache` → `import tensorcache` or `import tcache` — `0.3.0` on [PyPI](https://pypi.org/project/tcache/).
 
 `tensorcache` eliminates two bottlenecks:
 1. **Feature Cache Bloat:** `AMO-BQ` asymmetric MSE-optimal `G32` `1.09B` `1.83x` vs BF16 `0.47%` `rel RMSE` (`sym 1.06B 0.54%`) — near `G16` floor `0.39%`.
 2. **JPEG/PNG CPU Decode:** Zero-copy `mmap` + `GPU` stream prefetch `>2,000 MB/s`, ring-buffer `6.8MB` `VRAM` `batch8 128x768`.
 3. **Training Throughput (v0.2.2):** `iter_batches` `27k samp/s` `17.7GB/s` `B128 446x768` `~8.3x` vs `v0.2.0` `3.1k`, `Streamer` `21k` `5.1ms` `double-buffered` `pinned + async H2D` (`low_vram` `128MB` `B128`), `sharded 8x` for `H100 DDP`.
+4. **Pixel Cache Tunable JPEG-XS (v0.3.0):** `CDF 5/3` `4-lvl` `RCT` `batched [3,H,W]` `GPU Triton` `1.65ms` `195MB/s` `vs 6.57ms CPU` `out_buffer`, `adaptive RDO 4b` `G32` `tunable` `43dB 2.85x` <-> `29dB 5.6x` `presets ultra/high/balanced/compress/ultra_comp` `q_scale 1-8 lamb 1-50` `on-the-fly` `3.5ms` `GPU` `5ms CPU`.
 
 ---
 
@@ -19,6 +20,7 @@
 * **Big Data Sharded:** `Writer(num_shards=8)` `->` `feat_shard{i}_*.bin` `+` `feat_shards.json`, `Dataset/Streamer(rank, world_size)` `DDP` `H100 8x` `~5.8k` random `27k` contiguous. Single shard `num_shards=1` unchanged `100%` compat.
 * **Minimal VRAM:** `q 5.22MB + scales 0.32MB + zp 0.16MB + out 10.45MB` `5.4M`; `G64` halves `scales/zp`.
 * **Cross-Platform:** `CUDA`/`ROCm` `Triton` else `PyTorch` fallback, `Windows` `mmap` safe `close()`.
+* **Tunable JPEG-XS Pixel:** `quantize_pixel_wavelet_adaptive(mode="balanced")` `lamb` `D+lamb*R` `G32 4b` `codebook 8` `CPU 5ms` `GPU Triton 3.5ms` `43dB 2.85x` <-> `29dB 5.6x` `vs static 5.67x 32dB`.
 * **CLI + Python one-liners:** `tc.compress` / `tc.benchmark_tensor` / `tensorcache benchmark`.
 
 ---

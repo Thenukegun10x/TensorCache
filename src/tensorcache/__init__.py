@@ -19,6 +19,14 @@ from .codec import (
     dequantize_int4_g32,
     quantize_int3_g32,
     dequantize_int3_g32,
+    rct_forward,
+    rct_inverse,
+    quantize_pixel_wavelet8x,
+    dequantize_pixel_wavelet8x,
+    quantize_pixel_wavelet_adaptive,
+    dequantize_pixel_wavelet_adaptive,
+    ADAPTIVE_CODEBOOK,
+    WAVELET_ADAPTIVE_PRESETS,
 )
 from .utils import (
     compress,
@@ -35,6 +43,10 @@ from .fused_ops import (
     dequantize_fused_int4_gpu,
     quantize_fused_int3_gpu,
     dequantize_fused_int3_gpu,
+    quantize_fused_wavelet8x_gpu,
+    dequantize_fused_wavelet8x_gpu,
+    quantize_fused_wavelet_adaptive_gpu,
+    dequantize_fused_wavelet_adaptive_gpu,
     FusedDequantLinear
 )
 from .prefetcher import AsyncGPUPrefetcher
@@ -48,7 +60,7 @@ from .pixel_cache import (
 )
 from .streamer import ZeroCopyTensorStreamer
 
-__version__ = "0.2.4"
+__version__ = "0.3.0"
 __all__ = [
     "BlockwiseInt8Codec",
     "quantize_int8_g32",
@@ -65,6 +77,14 @@ __all__ = [
     "dequantize_int4_g32",
     "quantize_int3_g32",
     "dequantize_int3_g32",
+    "rct_forward",
+    "rct_inverse",
+    "quantize_pixel_wavelet8x",
+    "dequantize_pixel_wavelet8x",
+    "quantize_pixel_wavelet_adaptive",
+    "dequantize_pixel_wavelet_adaptive",
+    "ADAPTIVE_CODEBOOK",
+    "WAVELET_ADAPTIVE_PRESETS",
     "compress",
     "decompress",
     "estimate_compression",
@@ -77,6 +97,10 @@ __all__ = [
     "dequantize_fused_int4_gpu",
     "quantize_fused_int3_gpu",
     "dequantize_fused_int3_gpu",
+    "quantize_fused_wavelet8x_gpu",
+    "dequantize_fused_wavelet8x_gpu",
+    "quantize_fused_wavelet_adaptive_gpu",
+    "dequantize_fused_wavelet_adaptive_gpu",
     "FusedDequantLinear",
     "AsyncGPUPrefetcher",
     "FeatureCacheWriter",

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tcache"
-version = "0.2.4"
+version = "0.3.0"
 description = "Ultra-fast, high-fidelity block-wise INT8 feature & pixel cache engine for ML pipelines"
 readme = "README.md"
 requires-python = ">=3.9"

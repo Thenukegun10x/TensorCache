@@ -4,11 +4,14 @@ Unit tests for Fused Triton Kernels.
 
 import pytest
 import torch
+import math
 from tensorcache.fused_ops import (
     quantize_fused_gpu,
     dequantize_fused_gpu,
     dequantize_fused_int4_gpu,
     dequantize_fused_int3_gpu,
+    quantize_fused_wavelet8x_gpu,
+    dequantize_fused_wavelet8x_gpu,
     FusedDequantLinear,
     HAS_TRITON,
 )
@@ -116,12 +119,34 @@ def test_fused_dequant_linear():
     print(f"\n[+] Fused Dequant+Linear verified! Output Diff: {rel_diff:.4f}%")
 
 
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Functional CUDA/ROCm GPU + Triton required for Triton kernels")
+def test_fused_wavelet8x_gpu():
+    device = "cuda:0"
+    H, W, C = 64, 64, 3
+    raw = torch.randint(0, 256, (H, W, C), dtype=torch.float32, device=device).permute(2, 0, 1).unsqueeze(0)
+    img = torch.nn.functional.avg_pool2d(raw, kernel_size=3, stride=1, padding=1).squeeze(0).permute(1, 2, 0).byte()
+    
+    packed_meta, shape = quantize_fused_wavelet8x_gpu(img, q_scale=1.0)
+    rec = dequantize_fused_wavelet8x_gpu(packed_meta, device=device)
+    
+    assert rec.shape == (H, W, C)
+    assert rec.dtype == torch.uint8
+    diff = img.float() - rec.float()
+    mse = (diff ** 2).mean().item()
+    psnr = 20 * math.log10(255.0 / math.sqrt(mse)) if mse > 0 else float('inf')
+    rmse = (math.sqrt(mse) / 255.0) * 100.0
+    
+    assert psnr > 35.0
+    print(f"\n[+] Fused Wavelet 8x GPU Codec verified! PSNR: {psnr:.2f} dB, Rel RMSE: {rmse:.2f}%")
+
+
 if __name__ == "__main__":
     if GPU_AVAILABLE:
         test_fused_dequant_kernel()
         test_fused_dequant_int4_kernel()
         test_fused_dequant_int3_kernel()
         test_fused_dequant_linear()
+        test_fused_wavelet8x_gpu()
         print("\n[+] ALL FUSED KERNEL TESTS PASSED!")
     else:
         print("[-] Skipping: No functional CUDA/ROCm GPU + Triton detected.")
