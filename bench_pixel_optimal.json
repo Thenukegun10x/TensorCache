@@ -1,0 +1,115 @@
+{
+  "device": "AMD Radeon RX 9070 XT",
+  "pixel_rows": [
+    {
+      "Format": "Raw uint8",
+      "KB/img": "330.8",
+      "Ratio": "1.00x",
+      "PSNR dB": "inf",
+      "SSIM": "1.0000",
+      "MAE": "0.00",
+      "Max": "0",
+      "Throughput": "mmap 2100 MB/s"
+    },
+    {
+      "Format": "JPEG Q=95",
+      "KB/img": "52.0",
+      "Ratio": "6.37x",
+      "PSNR dB": "42.0",
+      "SSIM": "0.9992",
+      "MAE": "1.49",
+      "Max": "45",
+      "Throughput": "20.7 MB/s CPU"
+    },
+    {
+      "Format": "JPEG Q=85",
+      "KB/img": "30.5",
+      "Ratio": "10.84x",
+      "PSNR dB": "37.1",
+      "SSIM": "0.9974",
+      "MAE": "2.72",
+      "Max": "57",
+      "Throughput": "19.1 MB/s CPU"
+    },
+    {
+      "Format": "JPEG Q=75",
+      "KB/img": "23.1",
+      "Ratio": "14.34x",
+      "PSNR dB": "34.8",
+      "SSIM": "0.9955",
+      "MAE": "3.55",
+      "Max": "85",
+      "Throughput": "17.7 MB/s CPU"
+    },
+    {
+      "Format": "Block INT8 G=32 (pixel float)",
+      "KB/img": "351.4",
+      "Ratio": "0.94x",
+      "PSNR dB": "52.1",
+      "SSIM": "0.9999",
+      "MAE": "0.41",
+      "Max": "1",
+      "Throughput": "191752 MB/s GPU (0.11ms/64imgs)"
+    },
+    {
+      "Format": "Block INT8 G=64 (pixel float)",
+      "KB/img": "341.1",
+      "Ratio": "0.97x",
+      "PSNR dB": "51.9",
+      "SSIM": "0.9999",
+      "MAE": "0.42",
+      "Max": "1",
+      "Throughput": "186191 MB/s GPU (0.11ms/64imgs)"
+    },
+    {
+      "Format": "Block INT8 G=128 (pixel float)",
+      "KB/img": "335.9",
+      "Ratio": "0.98x",
+      "PSNR dB": "51.8",
+      "SSIM": "0.9999",
+      "MAE": "0.43",
+      "Max": "1",
+      "Throughput": "183026 MB/s GPU (0.11ms/64imgs)"
+    },
+    {
+      "Format": "Asym AMO-BQ G=32 pixel",
+      "KB/img": "361.8",
+      "Ratio": "0.91x",
+      "PSNR dB": "12.8",
+      "SSIM": "0.4384",
+      "MAE": "39.33",
+      "Max": "255",
+      "Throughput": "167275 MB/s GPU (0.12ms)"
+    },
+    {
+      "Format": "DCT8x8+INT8 G32 (est)",
+      "KB/img": "375.4",
+      "Ratio": "0.88x",
+      "PSNR dB": "47.5",
+      "SSIM": "0.9998",
+      "MAE": "0.78",
+      "Max": "-",
+      "Throughput": "5383 MB/s GPU est*"
+    },
+    {
+      "Format": "DCT8x8+INT8 G32 raw (no RLE)",
+      "KB/img": "351.4",
+      "Ratio": "0.94x",
+      "PSNR dB": "47.5",
+      "SSIM": "0.9998",
+      "MAE": "0.78",
+      "Max": "-",
+      "Throughput": "5383 MB/s"
+    },
+    {
+      "Format": "INT4 G32 pixel",
+      "KB/img": "186.0",
+      "Ratio": "1.78x",
+      "PSNR dB": "32.1",
+      "SSIM": "0.9928",
+      "MAE": "5.04",
+      "Max": "-",
+      "Throughput": "49013 MB/s (est unpack)"
+    }
+  ]
+}

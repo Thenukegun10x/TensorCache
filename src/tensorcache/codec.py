@@ -9,6 +9,7 @@ import math
 from typing import Tuple, Optional, Union
 import torch
 import torch.nn.functional as F
+import numpy as np
 
 # Check for Triton kernel availability
 try:
@@ -51,6 +52,83 @@ if HAS_TRITON:
         zp = tl.load(zp_ptr + scale_idx, mask=mask, other=0).to(tl.float32)
 
         out_bf16 = ((vals_u8 - zp) * scales).to(tl.bfloat16)
+        tl.store(out_ptr + offsets, out_bf16, mask=mask)
+
+    @triton.jit
+    def _triton_dequant_int4_kernel(
+        packed_ptr, scales_ptr, out_ptr, n_elements,
+        BLOCK_SIZE: tl.constexpr, GROUP_SIZE: tl.constexpr
+    ):
+        pid = tl.program_id(axis=0)
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+
+        byte_idx = offsets >> 1
+        bytes_u8 = tl.load(packed_ptr + byte_idx, mask=mask, other=0).to(tl.int32)
+        is_odd = (offsets & 1) != 0
+        nibble = tl.where(is_odd, (bytes_u8 >> 4) & 0x0F, bytes_u8 & 0x0F)
+        val_i8 = tl.where(nibble >= 8, nibble - 16, nibble).to(tl.float32)
+
+        if GROUP_SIZE == 32:
+            scale_idx = offsets >> 5
+        elif GROUP_SIZE == 64:
+            scale_idx = offsets >> 6
+        elif GROUP_SIZE == 16:
+            scale_idx = offsets >> 4
+        else:
+            scale_idx = offsets // GROUP_SIZE
+
+        scales = tl.load(scales_ptr + scale_idx, mask=mask, other=1.0).to(tl.float32)
+        out_bf16 = (val_i8 * scales).to(tl.bfloat16)
+        tl.store(out_ptr + offsets, out_bf16, mask=mask)
+
+    @triton.jit
+    def _triton_dequant_int3_kernel(
+        packed_ptr, scales_ptr, out_ptr, n_elements,
+        BLOCK_SIZE: tl.constexpr, GROUP_SIZE: tl.constexpr
+    ):
+        pid = tl.program_id(axis=0)
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+
+        t = offsets // 8
+        e = offsets % 8
+        base = t * 3
+
+        b0 = tl.load(packed_ptr + base, mask=mask, other=0).to(tl.int32)
+        b1 = tl.load(packed_ptr + base + 1, mask=mask, other=0).to(tl.int32)
+        b2 = tl.load(packed_ptr + base + 2, mask=mask, other=0).to(tl.int32)
+
+        v0 = (b0 >> 5) & 7
+        v1 = (b0 >> 2) & 7
+        v2 = ((b0 & 3) << 1) | ((b1 >> 7) & 1)
+        v3 = (b1 >> 4) & 7
+        v4 = (b1 >> 1) & 7
+        v5 = ((b1 & 1) << 2) | ((b2 >> 6) & 3)
+        v6 = (b2 >> 3) & 7
+        v7 = b2 & 7
+
+        val_u3 = tl.where(e == 0, v0,
+                 tl.where(e == 1, v1,
+                 tl.where(e == 2, v2,
+                 tl.where(e == 3, v3,
+                 tl.where(e == 4, v4,
+                 tl.where(e == 5, v5,
+                 tl.where(e == 6, v6, v7)))))))
+
+        val_i3 = (val_u3 - 4).to(tl.float32)
+
+        if GROUP_SIZE == 32:
+            scale_idx = offsets >> 5
+        elif GROUP_SIZE == 64:
+            scale_idx = offsets >> 6
+        elif GROUP_SIZE == 16:
+            scale_idx = offsets >> 4
+        else:
+            scale_idx = offsets // GROUP_SIZE
+
+        scales = tl.load(scales_ptr + scale_idx, mask=mask, other=1.0).to(tl.float32)
+        out_bf16 = (val_i3 * scales).to(tl.bfloat16)
         tl.store(out_ptr + offsets, out_bf16, mask=mask)
 
     # ------------------------------------------------------------------
@@ -180,6 +258,273 @@ def _sanitize_blocks(x_blocks: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor
         x_clean = torch.where(is_finite, x_blocks, torch.zeros_like(x_blocks))
         return x_clean, is_finite
     return x_blocks, is_finite
+
+
+# -----------------------------------------------------------------------------
+# Vectorized CPU Bit-Packing and Unpacking for INT4 & INT3 (Offline Processing)
+# -----------------------------------------------------------------------------
+
+def pack_int4(q: Union[np.ndarray, torch.Tensor]) -> np.ndarray:
+    """
+    Vectorized CPU pack 4-bit signed/unsigned values -> uint8 bytes (2 values per byte).
+    Even elements are stored in lower 4 bits (0x0F), odd elements in upper 4 bits (0xF0).
+    """
+    if isinstance(q, torch.Tensor):
+        q_np = q.detach().cpu().numpy()
+    else:
+        q_np = np.asarray(q)
+    n = q_np.size
+    q_flat = (q_np.reshape(-1).view(np.uint8) & 0x0F).astype(np.uint8)
+    pad_len = n % 2
+    if pad_len != 0:
+        q_flat = np.pad(q_flat, (0, 1))
+    packed = (q_flat[0::2] | (q_flat[1::2] << 4)).astype(np.uint8)
+    return packed
+
+
+def unpack_int4(packed: Union[np.ndarray, torch.Tensor], n_elements: int) -> np.ndarray:
+    """
+    Vectorized CPU unpack uint8 packed bytes -> signed int8 values in [-8, 7].
+    """
+    if isinstance(packed, torch.Tensor):
+        p_np = packed.detach().cpu().numpy()
+    else:
+        p_np = np.asarray(packed)
+    p_flat = p_np.reshape(-1)
+    low = (p_flat & 0x0F).astype(np.uint8)
+    high = ((p_flat >> 4) & 0x0F).astype(np.uint8)
+    unpacked = np.empty(p_flat.size * 2, dtype=np.uint8)
+    unpacked[0::2] = low
+    unpacked[1::2] = high
+    unpacked = unpacked[:n_elements]
+    # Sign extend 4-bit unsigned [0..15] to signed int8 [-8..7]
+    q_signed = np.where(unpacked >= 8, unpacked.astype(np.int16) - 16, unpacked.astype(np.int16)).astype(np.int8)
+    return q_signed
+
+
+def pack_int3(q: Union[np.ndarray, torch.Tensor]) -> np.ndarray:
+    """
+    Vectorized CPU pack 3-bit values -> uint8 bytes (8 values in 3 bytes = 24 bits).
+    Signed inputs in [-4, 3] are shifted by +4 to [0, 7].
+    """
+    if isinstance(q, torch.Tensor):
+        q_np = q.detach().cpu().numpy()
+    else:
+        q_np = np.asarray(q)
+    n = q_np.size
+    q_flat = q_np.reshape(-1)
+    if q_flat.dtype == np.int8 or np.issubdtype(q_flat.dtype, np.signedinteger):
+        q_u3 = ((q_flat.astype(np.int16) + 4) & 0x07).astype(np.uint8)
+    else:
+        q_u3 = (q_flat & 0x07).astype(np.uint8)
+
+    pad_len = (8 - (n % 8)) % 8
+    if pad_len > 0:
+        q_pad = np.pad(q_u3, (0, pad_len))
+    else:
+        q_pad = q_u3
+
+    q_8 = q_pad.reshape(-1, 8)
+    b0 = ((q_8[:, 0].astype(np.uint16) << 5) | (q_8[:, 1].astype(np.uint16) << 2) | (q_8[:, 2].astype(np.uint16) >> 1)).astype(np.uint8)
+    b1 = (((q_8[:, 2].astype(np.uint16) & 1) << 7) | (q_8[:, 3].astype(np.uint16) << 4) | (q_8[:, 4].astype(np.uint16) << 1) | (q_8[:, 5].astype(np.uint16) >> 2)).astype(np.uint8)
+    b2 = (((q_8[:, 5].astype(np.uint16) & 3) << 6) | (q_8[:, 6].astype(np.uint16) << 3) | q_8[:, 7].astype(np.uint16)).astype(np.uint8)
+
+    packed = np.column_stack([b0, b1, b2]).ravel()[: (n * 3 + 7) // 8]
+    return packed
+
+
+def unpack_int3(packed: Union[np.ndarray, torch.Tensor], n_elements: int) -> np.ndarray:
+    """
+    Vectorized CPU unpack uint8 packed bytes -> signed int8 values in [-4, 3].
+    """
+    if isinstance(packed, torch.Tensor):
+        p_np = packed.detach().cpu().numpy()
+    else:
+        p_np = np.asarray(packed)
+    p_flat = p_np.reshape(-1)
+    num_triplets = (n_elements + 7) // 8
+    triplets = np.zeros((num_triplets, 3), dtype=np.uint8)
+    num_bytes = min(p_flat.size, num_triplets * 3)
+    triplets.ravel()[:num_bytes] = p_flat[:num_bytes]
+
+    b0 = triplets[:, 0].astype(np.int16)
+    b1 = triplets[:, 1].astype(np.int16)
+    b2 = triplets[:, 2].astype(np.int16)
+
+    q0 = (b0 >> 5) & 7
+    q1 = (b0 >> 2) & 7
+    q2 = ((b0 & 3) << 1) | (b1 >> 7)
+    q3 = (b1 >> 4) & 7
+    q4 = (b1 >> 1) & 7
+    q5 = ((b1 & 1) << 2) | (b2 >> 6)
+    q6 = (b2 >> 3) & 7
+    q7 = b2 & 7
+
+    unpacked_u3 = np.column_stack([q0, q1, q2, q3, q4, q5, q6, q7]).ravel()[:n_elements]
+    q_signed = (unpacked_u3.astype(np.int16) - 4).astype(np.int8)
+    return q_signed
+
+
+# -----------------------------------------------------------------------------
+# INT4 & INT3 Group-wise Quantization and Dequantization API
+# -----------------------------------------------------------------------------
+
+def quantize_int4_g32(
+    x: torch.Tensor,
+    group_size: int = 32
+) -> Tuple[torch.Tensor, torch.Tensor, Tuple[int, ...]]:
+    """
+    Quantizes a tensor to block-wise 4-bit INT4 with BF16 scales.
+    Returns packed uint8 tensor (2 values per byte), scales, and orig_shape.
+    """
+    orig_shape = x.shape
+    x_flat = x.flatten().float()
+    numel = x.numel()
+
+    pad_len = (group_size - (numel % group_size)) % group_size
+    if pad_len > 0:
+        x_flat = F.pad(x_flat, (0, pad_len))
+
+    x_blocks = x_flat.view(-1, group_size)
+    x_clean, is_finite = _sanitize_blocks(x_blocks)
+    block_max = x_clean.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
+
+    scales = (block_max / 7.0).squeeze(-1).to(torch.bfloat16)
+
+    scaled = x_clean / (scales.unsqueeze(-1).float())
+    q_blocks = torch.round(scaled).clamp(-8, 7).to(torch.int8)
+    if not is_finite.all():
+        q_blocks = torch.where(is_finite.view_as(q_blocks), q_blocks, torch.zeros_like(q_blocks))
+
+    q_flat = q_blocks.flatten()[:numel]
+    packed_np = pack_int4(q_flat)
+    packed_t = torch.from_numpy(packed_np).to(x.device)
+    return packed_t, scales, orig_shape
+
+
+def dequantize_int4_g32(
+    q_packed: torch.Tensor,
+    scales: torch.Tensor,
+    orig_shape: Tuple[int, ...],
+    group_size: int = 32,
+    out_buffer: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    """
+    Dequantizes packed INT4 + BF16 scales back to BF16 tensor.
+    Uses fused Triton kernel if available on CUDA/HIP, otherwise fast vectorized PyTorch/NumPy.
+    """
+    numel = math.prod(orig_shape)
+    device = q_packed.device
+
+    if out_buffer is None:
+        out_buffer = torch.empty(orig_shape, dtype=torch.bfloat16, device=device)
+
+    if HAS_TRITON and device.type in ("cuda", "hip"):
+        try:
+            BLOCK_SIZE = 512
+            grid = (triton.cdiv(numel, BLOCK_SIZE),)
+            _triton_dequant_int4_kernel[grid](
+                q_packed, scales.flatten(), out_buffer, numel,
+                BLOCK_SIZE=BLOCK_SIZE, GROUP_SIZE=group_size,
+                num_warps=2
+            )
+            return out_buffer
+        except Exception:
+            pass
+
+    q_int8_np = unpack_int4(q_packed.cpu().numpy(), numel)
+    q_int8_t = torch.from_numpy(q_int8_np).to(device)
+
+    pad_len = (group_size - (numel % group_size)) % group_size
+    if pad_len > 0:
+        q_padded = F.pad(q_int8_t, (0, pad_len))
+    else:
+        q_padded = q_int8_t
+
+    blocks = q_padded.view(-1, group_size).float()
+    scales_flat = scales.flatten().unsqueeze(-1).float()
+    dequant = (blocks * scales_flat).flatten()[:numel]
+    out_buffer.copy_(dequant.view(orig_shape).to(torch.bfloat16))
+    return out_buffer
+
+
+def quantize_int3_g32(
+    x: torch.Tensor,
+    group_size: int = 32
+) -> Tuple[torch.Tensor, torch.Tensor, Tuple[int, ...]]:
+    """
+    Quantizes a tensor to block-wise 3-bit INT3 with BF16 scales.
+    Returns packed uint8 tensor (8 values per 3 bytes), scales, and orig_shape.
+    """
+    orig_shape = x.shape
+    x_flat = x.flatten().float()
+    numel = x.numel()
+
+    pad_len = (group_size - (numel % group_size)) % group_size
+    if pad_len > 0:
+        x_flat = F.pad(x_flat, (0, pad_len))
+
+    x_blocks = x_flat.view(-1, group_size)
+    x_clean, is_finite = _sanitize_blocks(x_blocks)
+    block_max = x_clean.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
+
+    scales = (block_max / 3.0).squeeze(-1).to(torch.bfloat16)
+
+    scaled = x_clean / (scales.unsqueeze(-1).float())
+    q_blocks = torch.round(scaled).clamp(-4, 3).to(torch.int8)
+    if not is_finite.all():
+        q_blocks = torch.where(is_finite.view_as(q_blocks), q_blocks, torch.zeros_like(q_blocks))
+
+    q_flat = q_blocks.flatten()[:numel]
+    packed_np = pack_int3(q_flat)
+    packed_t = torch.from_numpy(packed_np).to(x.device)
+    return packed_t, scales, orig_shape
+
+
+def dequantize_int3_g32(
+    q_packed: torch.Tensor,
+    scales: torch.Tensor,
+    orig_shape: Tuple[int, ...],
+    group_size: int = 32,
+    out_buffer: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    """
+    Dequantizes packed INT3 + BF16 scales back to BF16 tensor.
+    Uses fused Triton kernel if available on CUDA/HIP, otherwise fast vectorized PyTorch/NumPy.
+    """
+    numel = math.prod(orig_shape)
+    device = q_packed.device
+
+    if out_buffer is None:
+        out_buffer = torch.empty(orig_shape, dtype=torch.bfloat16, device=device)
+
+    if HAS_TRITON and device.type in ("cuda", "hip"):
+        try:
+            BLOCK_SIZE = 512
+            grid = (triton.cdiv(numel, BLOCK_SIZE),)
+            _triton_dequant_int3_kernel[grid](
+                q_packed, scales.flatten(), out_buffer, numel,
+                BLOCK_SIZE=BLOCK_SIZE, GROUP_SIZE=group_size,
+                num_warps=2
+            )
+            return out_buffer
+        except Exception:
+            pass
+
+    q_int8_np = unpack_int3(q_packed.cpu().numpy(), numel)
+    q_int8_t = torch.from_numpy(q_int8_np).to(device)
+
+    pad_len = (group_size - (numel % group_size)) % group_size
+    if pad_len > 0:
+        q_padded = F.pad(q_int8_t, (0, pad_len))
+    else:
+        q_padded = q_int8_t
+
+    blocks = q_padded.view(-1, group_size).float()
+    scales_flat = scales.flatten().unsqueeze(-1).float()
+    dequant = (blocks * scales_flat).flatten()[:numel]
+    out_buffer.copy_(dequant.view(orig_shape).to(torch.bfloat16))
+    return out_buffer
 
 
 def quantize_int8_g32(

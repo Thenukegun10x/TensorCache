@@ -15,6 +15,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from .codec import pack_int4, unpack_int4, pack_int3, unpack_int3
+
 try:
     import blosc2
     HAS_BLOSC2 = True
@@ -119,75 +121,14 @@ class PixelCacheWriter:
         amax = blocks.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
         scales = (amax / levels).squeeze(-1).to(torch.bfloat16)  # [M]
         # Quantize
-        q_blocks = torch.round(blocks / scales.unsqueeze(-1).float()).clamp(-levels-1, levels).to(torch.int8)  # [M,G] -levels-1..levels
-        # Pack
-        M = q_blocks.shape[0]
+        q_blocks = torch.round(blocks / scales.unsqueeze(-1).float()).clamp(-levels-1, levels).to(torch.int8)
+        q_flat = q_blocks.flatten()[:numel]
+
         if bits == 4:
-            # Pack 2x4b per byte
-            q_np = q_blocks.numpy().view(np.uint8)  # int8 as uint8
-            # Convert int8 -8..7 to uint4 0..15 via &0xF (already)
-            # Pack
-            packed = np.empty((M * G + 1)//2, dtype=np.uint8)
-            # Use vectorized pack
-            flat_q = q_np.flatten()  # [M*G] uint8
-            # Need to handle signed: q in -8..7 -> low 4b &0xF
-            # Pack low nibble first
-            # Use numpy
-            # flat_q is uint8 view of int8, so -1 =>0xFF => low 0xF
-            # Pack
-            packed[0::1] = 0  # init
-            # Do per pair
-            # Use torch for speed
-            q_flat = q_blocks.flatten()  # [M*G] int8
-            # Convert to uint4
-            q_u4 = (q_flat.numpy().view(np.uint8) & 0xF).astype(np.uint8)
-            # Pack
-            packed = np.empty((q_u4.size+1)//2, dtype=np.uint8)
-            packed[:] = (q_u4[1::2].astype(np.uint16) << 4 | q_u4[0::2].astype(np.uint16)).astype(np.uint8) if q_u4.size>1 else np.array([], dtype=np.uint8)
-            # Handle odd
-            if q_u4.size %2==1:
-                # last nibble
-                packed[-1] = q_u4[-1] & 0xF
-            q_packed = packed
-        else:  # bits 3
-            # Pack 3b per elem: 8*3=24b=3B per 8 elems
-            # For G=32, 32*3=96b=12B per block vs 4B for 8b (32B) => 2.66x
-            q_np = q_blocks.numpy().view(np.uint8).flatten()
-            # Need to pack 3b: use bitstream
-            # Convert q in -4..3 (levels=3) -> 0..7 via +4
-            q_u3 = ((q_blocks.flatten().numpy().view(np.int8).astype(np.int16) + 4) & 0x7).astype(np.uint8)  # 0..7
-            # Pack 8*3=24 bits =3 bytes per 8 elems
-            n = q_u3.size
-            out_bytes = (n*3 +7)//8
-            packed = np.zeros(out_bytes, dtype=np.uint8)
-            bit_pos=0
-            for i in range(n):
-                val = int(q_u3[i]) & 0x7
-                byte_idx = bit_pos // 8
-                bit_off = bit_pos % 8
-                # Need to handle spread across bytes
-                if bit_off <=5:
-                    packed[byte_idx] |= (val << (5 - bit_off)) & 0xFF
-                    # Actually pack MSB first
-                    # Simpler: use bitstring
-                    pass
-                bit_pos+=3
-            # For simplicity, fallback to loop packing correctly
-            # Use bitbuffer
-            q_packed = np.zeros(out_bytes, dtype=np.uint8)
-            bitbuf=0
-            bits_in_buf=0
-            out_idx=0
-            for v in q_u3:
-                bitbuf = (bitbuf << 3) | int(v)
-                bits_in_buf+=3
-                while bits_in_buf >=8:
-                    bits_in_buf-=8
-                    q_packed[out_idx] = (bitbuf >> bits_in_buf) & 0xFF
-                    out_idx+=1
-            # Handle remaining
-            if bits_in_buf>0:
-                q_packed[out_idx] = (bitbuf << (8 - bits_in_buf)) & 0xFF
+            q_packed = pack_int4(q_flat)
+        else:
+            q_packed = pack_int3(q_flat)
+
         scales_u16 = scales.view(torch.int16).cpu().numpy().view(np.uint16)
         return q_packed, scales_u16
 
@@ -328,122 +269,31 @@ class PixelCacheDataset(Dataset):
 
     def _dequantize_blockwise(self, q_packed: np.ndarray, scales_u16: np.ndarray) -> np.ndarray:
         """Dequantize packed int4/int3 q + BF16 scales -> uint8 [H,W,C]."""
-        # q_packed: [q_bytes] uint8, scales_u16: [blocks] uint16 BF16
         flat_size = self.elements_per_sample
-        G = self.group_size
         bits = self.quant_bits
-        levels = 2**(bits-1)-1
-        # Unpack q
-        # scales BF16
-        scales = scales_u16.view(np.int16).copy().view(np.uint16)  # ensure copy
-        # Actually scales_u16 is uint16 view of BF16, need to convert via torch
-        import torch
-        scales_t = torch.from_numpy(scales_u16.view(np.int16).copy()).view(torch.bfloat16).float().numpy()  # [blocks] float
-        # Unpack q
+
         if bits == 4:
-            # q_packed 0.5B/elem -> 16B per 32
-            # q_packed size ceil(flat/2)
-            # Need to unpack to int8 array flat
-            # q_packed as uint8, each byte has 2x4b
-            # Use numpy
-            q_u8 = np.frombuffer(q_packed.tobytes(), dtype=np.uint8) if isinstance(q_packed, np.ndarray) else np.frombuffer(q_packed, dtype=np.uint8)
-            # Actually q_packed is np array [q_bytes]
-            # Unpack
-            # For int4, q in -8..7, packed as low/high nibble &0xF then sign extend
-            # Create flat int8 array
-            n = flat_size
-            q = np.empty(n, dtype=np.int8)
-            # q_packed has (n+1)//2 bytes
-            # Use vectorized
-            # Low nibble first
-            # q_packed[0] has low = elem0, high = elem1
-            # So for i in 0..n-1, byte_idx = i//2, is_low = i%2==0
-            # Use numpy
-            q_packed_np = q_packed
-            # Expand
-            # Create uint4 values 0..15
-            # Use torch for simplicity
-            import torch as _t
-            q_packed_t = torch.from_numpy(q_packed_np).to(torch.uint8)
-            # Need to handle signed
-            # For int4, packed 4b signed: 0..7 =>0..7, 8..15 => -8..-1
-            # q_packed low/high already &0xF, need sign extend
-            # Use numpy
-            low = q_packed_np & 0xF
-            high = (q_packed_np >> 4) & 0xF
-            # Interleave
-            q_u4 = np.empty(n, dtype=np.uint8)
-            q_u4[0::2] = low[: (n+1)//2]
-            if n >1:
-                # Need to handle last if odd
-                # high has same size as low, but for odd n, last high is padding
-                q_u4[1::2] = high[: n//2]
-            # Convert uint4 0..15 to int8 -8..7
-            q_int8 = np.where(q_u4 >=8, q_u4.astype(np.int16)-16, q_u4.astype(np.int16)).astype(np.int8)
-            q = q_int8[:n]
-        else:  # bits 3
-            # Pack 3b per elem: 8*3=24b=3B per 8 elems
-            # q in -4..3 (levels=3) -> 0..7 via +4
-            n = flat_size
-            q = np.empty(n, dtype=np.int8)
-            # Bitstream unpack
-            # q_packed has ceil(n*3/8) bytes
-            data = q_packed.tobytes() if isinstance(q_packed, np.ndarray) else bytes(q_packed)
-            bitbuf=0
-            bits_in_buf=0
-            idx=0
-            pos=0
-            # Use bit buffer method
-            # For simplicity, unpack via loop (n=150k, loop 150k per image, okay for now)
-            # Use Python loop for correctness
-            # Convert to int for loop
-            # Use numpy for speed but loop okay for 150k*1k images?
-            # Keep simple loop
-            # Precompute bytes as ints
-            data_bytes = list(data) if isinstance(data, (bytes, bytearray)) else list(q_packed.tobytes())
-            # Use bit reader
-            byte_idx=0
-            bit_pos=0  # 0..7 inside byte, 0 is MSB?
-            # Our packing was MSB first: bitbuf <<3 | val, then flush when >=8
-            # So need to reverse
-            # Instead, use bitbuf method as in writer: we packed MSB first
-            # For unpack, we need to read 3 bits at a time MSB first
-            # Use bitstream
-            bitbuf=0
-            bits_in_buf=0
-            data_idx=0
-            for i in range(n):
-                while bits_in_buf <3:
-                    if data_idx < len(data_bytes):
-                        bitbuf = (bitbuf << 8) | data_bytes[data_idx]
-                        data_idx+=1
-                        bits_in_buf+=8
-                    else:
-                        break
-                bits_in_buf-=3
-                val = (bitbuf >> bits_in_buf) & 0x7
-                bitbuf &= (1<<bits_in_buf)-1 if bits_in_buf>0 else 0
-                # val 0..7 -> int8 -4..3 via -4
-                q[i] = int(val) - 4
-        # Dequant: rec = q * scale + 0? For symmetric with levels, scale = amax/levels, rec = q*scale
-        # But our quant was: t_norm = t/127.5-1 in -1..1, then q = round(t_norm/scale), scale=amax/levels
-        # So rec_norm = q*scale, then rec_uint8 = (rec_norm+1)*127.5
-        # Need to reconstruct per block
-        # blocks: q [M,G] and scales [M]
-        # For simplicity, do per block dequant in float then denormalize
-        import torch as _t
+            q_signed = unpack_int4(q_packed, flat_size)
+        else:
+            q_signed = unpack_int3(q_packed, flat_size)
+
         G = self.group_size
         pad_len = (G - flat_size % G) % G
         total = flat_size + pad_len
         M = total // G
-        q_t = torch.from_numpy(q.astype(np.int8).copy()).float().view(M, G)  # [M,G]
-        scales_t = torch.from_numpy(scales_u16.view(np.int16).copy()).view(torch.bfloat16).float()  # [M]
-        rec_blocks = q_t * scales_t.unsqueeze(-1)  # [M,G] in -1..1
-        rec_flat = rec_blocks.view(-1)[:flat_size]  # [flat]
-        # Denormalize -1..1 -> 0..255
-        rec_uint8 = ((rec_flat + 1.0) * 127.5).round().clamp(0,255).to(torch.uint8).numpy()
-        arr = rec_uint8.reshape(self.height, self.width, self.channels)
-        return arr
+
+        if pad_len > 0:
+            q_padded = np.pad(q_signed, (0, pad_len))
+        else:
+            q_padded = q_signed
+
+        q_t = torch.from_numpy(q_padded.copy()).float().view(M, G)
+        scales_t = torch.from_numpy(scales_u16.view(np.int16).copy()).view(torch.bfloat16).float()
+
+        rec_blocks = q_t * scales_t.unsqueeze(-1)
+        rec_flat = rec_blocks.view(-1)[:flat_size]
+        rec_uint8 = ((rec_flat + 1.0) * 127.5).round().clamp(0, 255).to(torch.uint8).numpy()
+        return rec_uint8.reshape(self.height, self.width, self.channels)
 
     def __getitem__(self, idx: int) -> torch.Tensor:
         if self.quant == "raw":

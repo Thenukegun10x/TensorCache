@@ -7,12 +7,36 @@ import torch
 from tensorcache.fused_ops import (
     quantize_fused_gpu,
     dequantize_fused_gpu,
-    FusedDequantLinear
+    dequantize_fused_int4_gpu,
+    dequantize_fused_int3_gpu,
+    FusedDequantLinear,
+    HAS_TRITON,
 )
-from tensorcache.codec import quantize_int8_g32, dequantize_int8_g32
+from tensorcache.codec import (
+    quantize_int8_g32,
+    dequantize_int8_g32,
+    quantize_int4_g32,
+    dequantize_int4_g32,
+    quantize_int3_g32,
+    dequantize_int3_g32,
+)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/ROCm GPU required for Triton kernels")
+def _is_functional_gpu() -> bool:
+    if not torch.cuda.is_available() or not HAS_TRITON:
+        return False
+    try:
+        t = torch.zeros(1, device="cuda:0")
+        del t
+        return True
+    except Exception:
+        return False
+
+
+GPU_AVAILABLE = _is_functional_gpu()
+
+
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Functional CUDA/ROCm GPU + Triton required for Triton kernels")
 def test_fused_dequant_kernel():
     device = "cuda:0"
     x = torch.randn(64, 446, 768, dtype=torch.bfloat16, device=device)
@@ -26,10 +50,44 @@ def test_fused_dequant_kernel():
     assert rec_fused.shape == x.shape
     assert rec_fused.dtype == torch.bfloat16
     assert rel_rmse < 1.0
-    print(f"\n[+] Fused Dequant Kernel verified! Rel RMSE: {rel_rmse:.4f}%")
+    print(f"\n[+] Fused INT8 Dequant Kernel verified! Rel RMSE: {rel_rmse:.4f}%")
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/ROCm GPU required for Triton kernels")
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Functional CUDA/ROCm GPU + Triton required for Triton kernels")
+def test_fused_dequant_int4_kernel():
+    device = "cuda:0"
+    x = torch.randn(16, 64, 768, dtype=torch.bfloat16, device=device)
+
+    q_packed, scales, shape = quantize_int4_g32(x, group_size=32)
+    rec_fused = dequantize_fused_int4_gpu(q_packed, scales, shape, group_size=32)
+
+    diff = x.float() - rec_fused.float()
+    rel_rmse = (torch.norm(diff) / torch.norm(x.float())).item() * 100.0
+
+    assert rec_fused.shape == x.shape
+    assert rec_fused.dtype == torch.bfloat16
+    assert rel_rmse < 10.0
+    print(f"\n[+] Fused INT4 Dequant Kernel verified! Rel RMSE: {rel_rmse:.4f}%")
+
+
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Functional CUDA/ROCm GPU + Triton required for Triton kernels")
+def test_fused_dequant_int3_kernel():
+    device = "cuda:0"
+    x = torch.randn(16, 64, 768, dtype=torch.bfloat16, device=device)
+
+    q_packed, scales, shape = quantize_int3_g32(x, group_size=32)
+    rec_fused = dequantize_fused_int3_gpu(q_packed, scales, shape, group_size=32)
+
+    diff = x.float() - rec_fused.float()
+    rel_rmse = (torch.norm(diff) / torch.norm(x.float())).item() * 100.0
+
+    assert rec_fused.shape == x.shape
+    assert rec_fused.dtype == torch.bfloat16
+    assert rel_rmse < 25.0
+    print(f"\n[+] Fused INT3 Dequant Kernel verified! Rel RMSE: {rel_rmse:.4f}%")
+
+
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Functional CUDA/ROCm GPU + Triton required for Triton kernels")
 def test_fused_dequant_linear():
     device = "cuda:0"
     M, K, N = 128, 768, 512
@@ -59,9 +117,11 @@ def test_fused_dequant_linear():
 
 
 if __name__ == "__main__":
-    if torch.cuda.is_available():
+    if GPU_AVAILABLE:
         test_fused_dequant_kernel()
+        test_fused_dequant_int4_kernel()
+        test_fused_dequant_int3_kernel()
         test_fused_dequant_linear()
         print("\n[+] ALL FUSED KERNEL TESTS PASSED!")
     else:
-        print("[-] Skipping: No CUDA/ROCm GPU detected.")
+        print("[-] Skipping: No functional CUDA/ROCm GPU + Triton detected.")

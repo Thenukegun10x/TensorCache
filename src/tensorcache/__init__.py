@@ -11,6 +11,14 @@ from .codec import (
     quantize_int8_amo_bq,
     dequantize_int8_amo_bq,
     AMO_BQ_PRESETS,
+    pack_int4,
+    unpack_int4,
+    pack_int3,
+    unpack_int3,
+    quantize_int4_g32,
+    dequantize_int4_g32,
+    quantize_int3_g32,
+    dequantize_int3_g32,
 )
 from .utils import (
     compress,
@@ -23,6 +31,10 @@ from .utils import (
 from .fused_ops import (
     quantize_fused_gpu,
     dequantize_fused_gpu,
+    quantize_fused_int4_gpu,
+    dequantize_fused_int4_gpu,
+    quantize_fused_int3_gpu,
+    dequantize_fused_int3_gpu,
     FusedDequantLinear
 )
 from .prefetcher import AsyncGPUPrefetcher
@@ -36,7 +48,7 @@ from .pixel_cache import (
 )
 from .streamer import ZeroCopyTensorStreamer
 
-__version__ = "0.2.3"
+__version__ = "0.2.4"
 __all__ = [
     "BlockwiseInt8Codec",
     "quantize_int8_g32",
@@ -45,6 +57,14 @@ __all__ = [
     "quantize_int8_amo_bq",
     "dequantize_int8_amo_bq",
     "AMO_BQ_PRESETS",
+    "pack_int4",
+    "unpack_int4",
+    "pack_int3",
+    "unpack_int3",
+    "quantize_int4_g32",
+    "dequantize_int4_g32",
+    "quantize_int3_g32",
+    "dequantize_int3_g32",
     "compress",
     "decompress",
     "estimate_compression",
@@ -53,6 +73,10 @@ __all__ = [
     "help_text",
     "quantize_fused_gpu",
     "dequantize_fused_gpu",
+    "quantize_fused_int4_gpu",
+    "dequantize_fused_int4_gpu",
+    "quantize_fused_int3_gpu",
+    "dequantize_fused_int3_gpu",
     "FusedDequantLinear",
     "AsyncGPUPrefetcher",
     "FeatureCacheWriter",

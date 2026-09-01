@@ -226,6 +226,131 @@ if HAS_TRITON:
 
 
     # -------------------------------------------------------------------------
+    # 2b. Fused Dequantization Kernels for INT4 & INT3
+    # -------------------------------------------------------------------------
+    @triton.jit
+    def _fused_dequant_int4_kernel(
+        packed_ptr, scales_ptr, out_ptr, n_elements,
+        BLOCK_SIZE: tl.constexpr, GROUP_SIZE: tl.constexpr
+    ):
+        pid = tl.program_id(axis=0)
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+
+        byte_idx = offsets >> 1
+        bytes_u8 = tl.load(packed_ptr + byte_idx, mask=mask, other=0).to(tl.int32)
+        is_odd = (offsets & 1) != 0
+        nibble = tl.where(is_odd, (bytes_u8 >> 4) & 0x0F, bytes_u8 & 0x0F)
+        val_i8 = tl.where(nibble >= 8, nibble - 16, nibble).to(tl.float32)
+
+        if GROUP_SIZE == 32:
+            scale_idx = offsets >> 5
+        elif GROUP_SIZE == 64:
+            scale_idx = offsets >> 6
+        elif GROUP_SIZE == 16:
+            scale_idx = offsets >> 4
+        else:
+            scale_idx = offsets // GROUP_SIZE
+
+        scales = tl.load(scales_ptr + scale_idx, mask=mask, other=1.0).to(tl.float32)
+        out_bf16 = (val_i8 * scales).to(tl.bfloat16)
+        tl.store(out_ptr + offsets, out_bf16, mask=mask)
+
+
+    def dequantize_fused_int4_gpu(
+        q_packed: torch.Tensor, scales: torch.Tensor, orig_shape: Tuple[int, ...],
+        group_size: int = 32, out_buffer: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        numel = math.prod(orig_shape)
+        if out_buffer is None:
+            out_buffer = torch.empty(orig_shape, dtype=torch.bfloat16, device=q_packed.device)
+        BLOCK_SIZE = 128
+        grid = (triton.cdiv(numel, BLOCK_SIZE),)
+        _fused_dequant_int4_kernel[grid](
+            q_packed, scales, out_buffer, numel,
+            BLOCK_SIZE=BLOCK_SIZE, GROUP_SIZE=group_size
+        )
+        return out_buffer
+
+
+    def quantize_fused_int4_gpu(x: torch.Tensor, group_size: int = 32) -> Tuple[torch.Tensor, torch.Tensor, Tuple[int, ...]]:
+        from .codec import quantize_int4_g32
+        return quantize_int4_g32(x, group_size)
+
+
+    @triton.jit
+    def _fused_dequant_int3_kernel(
+        packed_ptr, scales_ptr, out_ptr, n_elements,
+        BLOCK_SIZE: tl.constexpr, GROUP_SIZE: tl.constexpr
+    ):
+        pid = tl.program_id(axis=0)
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+
+        t = offsets // 8
+        e = offsets % 8
+        base = t * 3
+
+        b0 = tl.load(packed_ptr + base, mask=mask, other=0).to(tl.int32)
+        b1 = tl.load(packed_ptr + base + 1, mask=mask, other=0).to(tl.int32)
+        b2 = tl.load(packed_ptr + base + 2, mask=mask, other=0).to(tl.int32)
+
+        v0 = (b0 >> 5) & 7
+        v1 = (b0 >> 2) & 7
+        v2 = ((b0 & 3) << 1) | ((b1 >> 7) & 1)
+        v3 = (b1 >> 4) & 7
+        v4 = (b1 >> 1) & 7
+        v5 = ((b1 & 1) << 2) | ((b2 >> 6) & 3)
+        v6 = (b2 >> 3) & 7
+        v7 = b2 & 7
+
+        val_u3 = tl.where(e == 0, v0,
+                 tl.where(e == 1, v1,
+                 tl.where(e == 2, v2,
+                 tl.where(e == 3, v3,
+                 tl.where(e == 4, v4,
+                 tl.where(e == 5, v5,
+                 tl.where(e == 6, v6, v7)))))))
+
+        val_i3 = (val_u3 - 4).to(tl.float32)
+
+        if GROUP_SIZE == 32:
+            scale_idx = offsets >> 5
+        elif GROUP_SIZE == 64:
+            scale_idx = offsets >> 6
+        elif GROUP_SIZE == 16:
+            scale_idx = offsets >> 4
+        else:
+            scale_idx = offsets // GROUP_SIZE
+
+        scales = tl.load(scales_ptr + scale_idx, mask=mask, other=1.0).to(tl.float32)
+        out_bf16 = (val_i3 * scales).to(tl.bfloat16)
+        tl.store(out_ptr + offsets, out_bf16, mask=mask)
+
+
+    def dequantize_fused_int3_gpu(
+        q_packed: torch.Tensor, scales: torch.Tensor, orig_shape: Tuple[int, ...],
+        group_size: int = 32, out_buffer: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        numel = math.prod(orig_shape)
+        if out_buffer is None:
+            out_buffer = torch.empty(orig_shape, dtype=torch.bfloat16, device=q_packed.device)
+        BLOCK_SIZE = 128
+        grid = (triton.cdiv(numel, BLOCK_SIZE),)
+        _fused_dequant_int3_kernel[grid](
+            q_packed, scales, out_buffer, numel,
+            BLOCK_SIZE=BLOCK_SIZE, GROUP_SIZE=group_size
+        )
+        return out_buffer
+
+
+    def quantize_fused_int3_gpu(x: torch.Tensor, group_size: int = 32) -> Tuple[torch.Tensor, torch.Tensor, Tuple[int, ...]]:
+        from .codec import quantize_int3_g32
+        return quantize_int3_g32(x, group_size)
+
+
+
+    # -------------------------------------------------------------------------
     # 3. Fused Dequant + Linear Layer (Y = Dequant(X_int8) @ W.T + bias)
     # -------------------------------------------------------------------------
     @triton.jit
@@ -364,9 +489,27 @@ else:
         from .codec import dequantize_int8_g32
         return dequantize_int8_g32(q_int8, scales, orig_shape, group_size, out_buffer)
 
+    def quantize_fused_int4_gpu(x: torch.Tensor, group_size: int = 32):
+        from .codec import quantize_int4_g32
+        return quantize_int4_g32(x, group_size)
+
+    def dequantize_fused_int4_gpu(q_packed: torch.Tensor, scales: torch.Tensor, orig_shape: Tuple[int, ...], group_size: int = 32, out_buffer: Optional[torch.Tensor] = None):
+        from .codec import dequantize_int4_g32
+        return dequantize_int4_g32(q_packed, scales, orig_shape, group_size, out_buffer)
+
+    def quantize_fused_int3_gpu(x: torch.Tensor, group_size: int = 32):
+        from .codec import quantize_int3_g32
+        return quantize_int3_g32(x, group_size)
+
+    def dequantize_fused_int3_gpu(q_packed: torch.Tensor, scales: torch.Tensor, orig_shape: Tuple[int, ...], group_size: int = 32, out_buffer: Optional[torch.Tensor] = None):
+        from .codec import dequantize_int3_g32
+        return dequantize_int3_g32(q_packed, scales, orig_shape, group_size, out_buffer)
+
     _fused_quant_kernel = None
     _fused_amo_quant_kernel = None
     _fused_dequant_kernel = None
+    _fused_dequant_int4_kernel = None
+    _fused_dequant_int3_kernel = None
     _fused_dequant_matmul_kernel = None
 
     class FusedDequantLinear(nn.Module):
