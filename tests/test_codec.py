@@ -250,6 +250,11 @@ def test_xs_pixel_cache():
         prefix = str(Path(tmpdir) / "xs_cache")
         H, W, N = 64, 64, 4
         imgs = [_natural_test_img(H, W, seed=s) for s in range(N)]
+        # +1 white-noise image: dense occupancy forces nonzero alignment pads
+        # in the packed blob layout (regression: pad bytes leaked into i8).
+        torch.manual_seed(0)
+        imgs.append(torch.randint(0, 256, (H, W, 3), dtype=torch.uint8))
+        N += 1
         writer = PixelCacheWriter(prefix, num_samples=N, height=H, width=W, channels=3,
                                   quant="xs", xs_mode="balanced")
         for im in imgs:

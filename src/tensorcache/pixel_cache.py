@@ -511,7 +511,7 @@ class PixelCacheDataset(Dataset):
             "B": int(sh["B"]),
             "P": P,
             "arena_u8": blob[0:o1],
-            "arena_i8": blob[o1:o2].view(torch.int8),
+            "arena_i8": blob[o1:o1 + i8_len].view(torch.int8),
             "meta": blob[o2:o3].view(torch.int32).view(n_planes, 8),
             "ll4": blob[o3:o3 + ll4_len * 2].view(torch.int16),
             "ll4_shapes": [tuple(s) for s in sh["ll4_shapes"]],
