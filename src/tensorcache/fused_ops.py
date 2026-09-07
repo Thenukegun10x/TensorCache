@@ -10,6 +10,7 @@ Fused Triton Kernels for TensorCache:
 from __future__ import annotations
 
 import math
+import os
 from typing import Tuple, Optional
 import torch
 import torch.nn as nn
@@ -756,7 +757,8 @@ if HAS_TRITON:
 
     @triton.jit
     def _xs_k2_gather(plane_ptr, blk_ptr, pstart_ptr, arena_ptr, varena_ptr, meta_ptr,
-                      occ_ptr, word_ptr, pop_ptr, voff_ptr, codebook_ptr, out_ptr, B,
+                      occ_ptr, word_ptr, pop_ptr, voff_ptr, codebook_ptr, out_ptr,
+                      obase_ptr, phw_ptr, B,
                       ADAPTIVE: tl.constexpr, BLOCK: tl.constexpr):
         pid = tl.program_id(0)
         offs = pid * BLOCK + tl.arange(0, BLOCK)
@@ -771,6 +773,11 @@ if HAS_TRITON:
         vbase = tl.where(ps > 0, tl.load(voff_ptr + ps - 1, mask=m, other=0).to(tl.int32), 0)
         vals_base = tl.load(meta_ptr + p * 8 + 4, mask=m, other=0)
         param = tl.load(meta_ptr + p * 8 + 6, mask=m, other=0)
+        # Direct-to-final-layout: block writes its coeffs at the plane's
+        # packed offset (no pad waste, no restack). Tail blocks are masked.
+        obase = tl.load(obase_ptr + offs, mask=m, other=0)
+        hw = tl.load(phw_ptr + p, mask=m, other=0)
+        valid = hw - b * 32
         if ADAPTIVE:
             idx_base = tl.load(meta_ptr + p * 8 + 5, mask=m, other=0)
             ibyte = tl.load(arena_ptr + idx_base + (b >> 1), mask=m, other=0).to(tl.int32)
@@ -779,39 +786,135 @@ if HAS_TRITON:
             step_f = param.to(tl.float32) * cb
         vstart = vals_base + vo - pp - vbase
         cnt = tl.zeros([BLOCK], dtype=tl.int32)
-        obase = offs * 32
         for j in range(32):
             bit = (word >> j) & 1
-            vv = tl.load(varena_ptr + vstart + cnt, mask=m & (occ != 0) & (bit != 0), other=0).to(tl.int32)
+            keep = (occ != 0) & (bit != 0) & (j < valid)
+            vv = tl.load(varena_ptr + vstart + cnt, mask=m & keep, other=0).to(tl.int32)
             if ADAPTIVE:
                 f = (vv.to(tl.float32) * step_f).to(tl.int32)
             else:
                 half = param >> 1
                 sgn = tl.where(vv > 0, 1, tl.where(vv < 0, -1, 0))
                 f = vv * param + sgn * half
-            tl.store(out_ptr + obase + j, tl.where((occ != 0) & (bit != 0), f, 0), mask=m)
+            # Tail blocks must not spill past the packed plane region into
+            # the next plane (masks the store address, not just the value).
+            tl.store(out_ptr + obase + j, tl.where(keep, f, 0), mask=m & (j < valid))
             cnt += bit
 
     _xs_decode_cache: dict = {}
 
     def _xs_pattern_tables(inv, B, P, key):
-        """Cached per-config block index tables (CPU): plane id + block id."""
+        """Cached per-config block index tables (CPU): plane/block id, K2 output layout.
+
+        obase[b]: packed int32 offset of block b in the image's plane-concat
+        buffer (plane hw offsets + blk*32, no pad waste). phw[p]: h*w of
+        plane p for K2 tail masking. hw_off: plane hw offsets (len P+1).
+        """
         ent = _xs_decode_cache.get(key)
         if ent is None:
             plane = torch.zeros(B, dtype=torch.int32)
             blk = torch.zeros(B, dtype=torch.int32)
+            obase = torch.zeros(B, dtype=torch.int32)
             pstarts = [0]
             for (name, c, h, w, M) in inv:
                 pstarts.append(pstarts[-1] + M)
+            hw_off = [0]
+            for (name, c, h, w, M) in inv:
+                hw_off.append(hw_off[-1] + h * w)
+            phw = torch.tensor([h * w for (name, c, h, w, M) in inv], dtype=torch.int32)
             for i, (name, c, h, w, M) in enumerate(inv):
                 s = pstarts[i]
                 plane[s:s + M] = i
                 blk[s:s + M] = torch.arange(M, dtype=torch.int32)
-            ent = {"plane": plane, "blk": blk,
+                obase[s:s + M] = hw_off[i] + torch.arange(M, dtype=torch.int32) * 32
+            ent = {"plane": plane, "blk": blk, "obase": obase, "phw": phw,
                    "pstart": torch.tensor(pstarts, dtype=torch.int32),
+                   "hw_off": hw_off, "HWsum": hw_off[-1],
                    "B": B, "P": P}
             _xs_decode_cache[key] = ent
         return ent
+
+    _xs_gpu_tables: dict = {}
+    _xs_compile_cache: dict = {}
+
+    def _xs_gpu_index_tables(key_single, N, dev, pent):
+        """H2D-cached global index tables for a (config, batch, device).
+
+        Kills 4-5 H2D transfers + CPU table concat per batch. Tables are
+        static per (config, N); safe to cache forever (tiny).
+        """
+        ck = (key_single, N, str(dev))
+        ent = _xs_gpu_tables.get(ck)
+        if ent is None:
+            B, P = pent["B"], pent["P"]
+            plane_single, blk_single = pent["plane"], pent["blk"]
+            obase_single, phw_single = pent["obase"], pent["phw"]
+            if N > 1:
+                plane_global = torch.cat([plane_single + n * P for n in range(N)], dim=0)
+                blk_global = torch.cat([blk_single] * N, dim=0)
+                obase_global = torch.cat(
+                    [obase_single + n * pent["HWsum"] for n in range(N)], dim=0)
+                phw_global = torch.cat([phw_single] * N, dim=0)
+            else:
+                plane_global, blk_global = plane_single, blk_single
+                obase_global, phw_global = obase_single, phw_single
+            ps = pent["pstart"].tolist()
+            pstart_list = [0]
+            for n in range(N):
+                base = n * B
+                for i in range(P):
+                    pstart_list.append(base + int(ps[i + 1]))
+            ent = {
+                "dplane": plane_global.to(dev),
+                "dblk": blk_global.to(dev),
+                "dpstart": torch.tensor(pstart_list, dtype=torch.int32).to(dev),
+                "dobase": obase_global.to(dev),
+                "dphw": phw_global.to(dev),
+            }
+            _xs_gpu_tables[ck] = ent
+        return ent
+
+    def _maybe_compile(fn, name):
+        """torch.compile wrapper: Inductor on CUDA/ROCm/CPU, eager fallback.
+
+        GPU-agnostic fusion (no CUDA-only APIs, no graphs): fuses the ~40
+        elementwise synthesis launches into a few kernels. Any failure
+        (missing inductor, unsupported op, ...) falls back to eager once
+        and stays there. TENSORCACHE_NO_COMPILE=1 forces eager.
+        """
+        def wrapper(*args, **kwargs):
+            if os.environ.get("TENSORCACHE_NO_COMPILE"):
+                return fn(*args, **kwargs)
+            hit = _xs_compile_cache.get(name, None)
+            if hit is None:
+                cfn = None
+                if hasattr(torch, "compile"):
+                    try:
+                        cfn = torch.compile(fn, mode="default", dynamic=False)
+                    except Exception:
+                        cfn = None
+                # None marker would be ambiguous with cache miss, so store
+                # a tuple (ok, callable).
+                hit = (cfn is not None, cfn if cfn is not None else fn)
+                _xs_compile_cache[name] = hit
+            ok, cfn = hit
+            if not ok:
+                return fn(*args, **kwargs)
+            try:
+                return cfn(*args, **kwargs)
+            except Exception:
+                _xs_compile_cache[name] = (False, fn)
+                return fn(*args, **kwargs)
+        return wrapper
+
+    def _popcount32_eager(word: torch.Tensor) -> torch.Tensor:
+        # popcount per int32 element without [BT,32] materialization.
+        # SWAR: exact integer math, compiles to one fused kernel.
+        x = word.to(torch.int32)
+        x = x - ((x >> 1) & 0x55555555)
+        x = (x & 0x33333333) + ((x >> 2) & 0x33333333)
+        x = (x + (x >> 4)) & 0x0F0F0F0F
+        return ((x * 0x01010101) >> 24) & 0xFF
 
     def _synthesize_wavelet_planes_gpu(LL4, rec_planes, sub, H, W, out_buffer=None):
         # Shared synthesis: 4-stage IDWT chain(s) + fused RCT store.
@@ -872,11 +975,12 @@ if HAS_TRITON:
         from .codec import sparse_pack_arena
         return sparse_pack_arena(sparse)
 
-    def _synthesize_wavelet_batch_gpu(LL4b, recb, sub, H, W):
+    def _synthesize_wavelet_batch_eager(LL4b, recb, sub, H, W):
         """Batched synthesis [N,3,h4,w4] + rec planes -> [N,H,W,3] uint8 (torch, bit-exact).
 
         Uses the same integer lifting as the Triton single path, but with the
         batch folded into the leading dims so one launch covers all images.
+        Pure tensor ops (no data-dependent Python) so torch.compile fuses it.
         """
         from .codec import _idwt_53_2d_step_batched, _upsample2, rct_inverse
 
@@ -905,6 +1009,10 @@ if HAS_TRITON:
         rec_rgb_full = rct_inverse(rec_yuv)
         return rec_rgb_full[:, :H, :W, :]
 
+    _synthesize_wavelet_batch_gpu = _maybe_compile(
+        _synthesize_wavelet_batch_eager, "xs_synth")
+    _popcount32 = _maybe_compile(_popcount32_eager, "xs_popcount")
+
     def dequantize_sparse_wavelet_batch_gpu(
         arenas: list,
         device: str | torch.device = "cuda:0",
@@ -932,9 +1040,12 @@ if HAS_TRITON:
         P, B = int(a0["P"]), int(a0["B"])
         key_single = (adaptive, tuple(a0["orig_shape"]), tuple(inv))
         pent = _xs_pattern_tables(inv, B, P, key_single)
-        plane_single = pent["plane"]
-        blk_single = pent["blk"]
-        pstart_single = pent["pstart"]
+        HWsum = int(pent["HWsum"])
+        hw_off = pent["hw_off"]
+        # Static index tables live on-GPU across batches (H2D once per config)
+        gt = _xs_gpu_index_tables(key_single, N, dev, pent)
+        dplane, dblk = gt["dplane"], gt["dblk"]
+        dpstart, dobase, dphw = gt["dpstart"], gt["dobase"], gt["dphw"]
         # Concat arenas + fixup meta offsets (CPU, no syncs)
         au8_list, ai8_list, ll4_list, meta_rows = [], [], [], []
         OU = OI = 0
@@ -953,24 +1064,8 @@ if HAS_TRITON:
         arena_i8 = torch.cat(ai8_list, dim=0).to(torch.int8)
         meta = torch.cat(meta_rows, dim=0)
         ll4_flat = torch.cat(ll4_list, dim=0)
-        if N > 1:
-            plane_global = torch.cat([plane_single + n * P for n in range(N)], dim=0)
-            blk_global = torch.cat([blk_single] * N, dim=0)
-        else:
-            plane_global = plane_single
-            blk_global = blk_single
-        ps = pstart_single.tolist()
-        pstart_list = [0]
-        for n in range(N):
-            base = n * B
-            for i in range(P):
-                pstart_list.append(base + int(ps[i + 1]))
-        pstart_global = torch.tensor(pstart_list, dtype=torch.int32)
         BT, PT = N * B, N * P
-        # H2D once
-        dplane = plane_global.to(dev, non_blocking=True)
-        dblk = blk_global.to(dev, non_blocking=True)
-        dpstart = pstart_global.to(dev, non_blocking=True)
+        # H2D: data only (index tables are cached on-device)
         darena = arena_u8.to(dev, non_blocking=True)
         dvals = arena_i8.to(dev, non_blocking=True)
         dmeta = meta.to(dev, non_blocking=True)
@@ -991,8 +1086,10 @@ if HAS_TRITON:
         hsel = torch.empty(BT, dtype=torch.uint8, device=dev)
         _xs_k1a_mode[grid](dplane, dblk, dpstart, darena, dmeta, occ, orank,
                            mode, fsel, hsel, BT, BLOCK=BLOCK)
-        frank = fsel.to(torch.int32).cumsum(0) - 1
-        hrank = hsel.to(torch.int32).cumsum(0) - 1
+        # One stacked scan instead of two (same barrier, 1 launch, agnostic torch)
+        fh = torch.stack(
+            [fsel.to(torch.int32), hsel.to(torch.int32)], dim=0).cumsum(1) - 1
+        frank, hrank = fh[0], fh[1]
         word = torch.zeros(BT, dtype=torch.int32, device=dev)
         kval = torch.zeros(BT, dtype=torch.int32, device=dev)
         presb = torch.zeros(BT, dtype=torch.int32, device=dev)
@@ -1003,30 +1100,30 @@ if HAS_TRITON:
         niboff = kval.cumsum(0)
         _xs_k1c_hier[grid](dplane, dpstart, darena, dmeta, occ, mode, presb,
                            kval, niboff, word, BT, BLOCK=BLOCK)
-        ar32 = torch.arange(32, device=dev)
-        pop = (((word.unsqueeze(-1) >> ar32) & 1).sum(-1).to(torch.int32))
+        # SWAR popcount (no [BT,32] temp) then the single trailing scan
+        pop = _popcount32(word)
         voff = pop.cumsum(0)
-        out = torch.empty(BT * 32, dtype=torch.int32, device=dev)
+        # K2 writes the final plane-packed layout directly: no pad waste,
+        # no restack copies, views below are free.
+        out = torch.empty(N * HWsum, dtype=torch.int32, device=dev)
         _xs_k2_gather[grid](dplane, dblk, dpstart, darena, dvals, dmeta, occ,
-                            word, pop, voff, codebook, out, BT, ADAPTIVE=adaptive,
-                            BLOCK=BLOCK)
-        # Split into batched rec planes [N,k,h,w] per name
+                            word, pop, voff, codebook, out, dobase, dphw,
+                            BT, ADAPTIVE=adaptive, BLOCK=BLOCK)
+        # One stack per plane-name (views, single copy) -> [N,k,h,w]
         name_to_entries: dict = {}
         for i, (name, c, h, w, M) in enumerate(inv):
             name_to_entries.setdefault(name, []).append((i, h, w))
         recb: dict = {}
         for name, entries in name_to_entries.items():
             h0, w0 = entries[0][1], entries[0][2]
-            per_img = []
+            parts = []
             for n in range(N):
-                base_out = n * B * 32
-                ch_lst = []
+                base_out = n * HWsum
                 for (i, h, w) in entries:
                     assert h == h0 and w == w0
-                    s = base_out + int(ps[i]) * 32
-                    ch_lst.append(out[s:s + h * w].view(h, w))
-                per_img.append(torch.stack(ch_lst, dim=0))
-            recb[name] = torch.stack(per_img, dim=0)
+                    s = base_out + hw_off[i]
+                    parts.append(out[s:s + h * w].view(h, w))
+            recb[name] = torch.stack(parts, dim=0).view(N, len(entries), h0, w0)
         sub = not any((nm == "LH1" and cc == 1) for (nm, cc, hh, ww, MM) in inv)
         return _synthesize_wavelet_batch_gpu(LL4b, recb, sub, H, W)
 
