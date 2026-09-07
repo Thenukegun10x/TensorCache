@@ -8,7 +8,7 @@
 1. **Feature Cache Bloat:** `AMO-BQ` asymmetric MSE-optimal `G32` `1.09B` `1.83x` vs BF16 `0.47%` `rel RMSE` (`sym 1.06B 0.54%`) — near `G16` floor `0.39%`.
 2. **JPEG/PNG CPU Decode:** Zero-copy `mmap` + `GPU` stream prefetch `>2,000 MB/s`, ring-buffer `6.8MB` `VRAM` `batch8 128x768`.
 3. **Training Throughput (v0.2.2):** `iter_batches` `27k samp/s` `17.7GB/s` `B128 446x768` `~8.3x` vs `v0.2.0` `3.1k`, `Streamer` `21k` `5.1ms` `double-buffered` `pinned + async H2D` (`low_vram` `128MB` `B128`), `sharded 8x` for `H100 DDP`.
-4. **Pixel Cache Tunable JPEG-XS (v0.3.0):** `CDF 5/3` `4-lvl` `RCT` `4:2:0` `batched [3,H,W]` `GPU Triton` `out_buffer`, `adaptive RDO 4b` `G32` `16-lvl codebook` `subband gains` `sparse bitstream` `zero-block skip` `tunable` `45dB 3.0x` <-> `33dB 12x` (`balanced 37dB 6.9x`, `static 34dB 10x` measured COCO val 336) `presets ultra/high/balanced/compress/ultra_comp` `q_scale 1-8 lamb 1-50`.
+4. **Pixel Cache Tunable JPEG-XS (v0.3.0):** `CDF 5/3` `4-lvl` `RCT` `4:2:0` `batched [3,H,W]` `GPU Triton` `out_buffer`, `adaptive RDO 4b` `G32` `16-lvl codebook` `TCQ-lite` `subband gains` `sparse bitstream` `zero-block skip` `hier nibble masks` `tunable` `44dB 3.2x` <-> `33dB 13.6x` (`balanced 37dB 7.8x`, `static 34dB 11.5x` measured COCO val 336) `presets ultra/high/balanced/compress/ultra_comp` `q_scale 1-8 lamb 1-50`.
 
 ---
 
@@ -20,7 +20,7 @@
 * **Big Data Sharded:** `Writer(num_shards=8)` `->` `feat_shard{i}_*.bin` `+` `feat_shards.json`, `Dataset/Streamer(rank, world_size)` `DDP` `H100 8x` `~5.8k` random `27k` contiguous. Single shard `num_shards=1` unchanged `100%` compat.
 * **Minimal VRAM:** `q 5.22MB + scales 0.32MB + zp 0.16MB + out 10.45MB` `5.4M`; `G64` halves `scales/zp`.
 * **Cross-Platform:** `CUDA`/`ROCm` `Triton` else `PyTorch` fallback, `Windows` `mmap` safe `close()`.
-* **Tunable JPEG-XS Pixel:** `quantize_pixel_wavelet_adaptive(mode="balanced")` `lamb` `D+lamb*R` `G32 4b` `codebook 16` `subband gains` `4:2:0` `sparse + zero-block skip` `37dB 6.9x` (`45dB 3.0x` <-> `33dB 12x`, COCO val 336) `vs static 34dB 10x`.
+* **Tunable JPEG-XS Pixel:** `quantize_pixel_wavelet_adaptive(mode="balanced")` `lamb` `D+lamb*R` `G32 4b` `codebook 16` `TCQ-lite` `subband gains` `4:2:0` `sparse + zero-block skip + hier masks` `37dB 7.8x` (`44dB 3.2x` <-> `33dB 13.6x`, COCO val 336) `vs static 34dB 11.5x`.
 * **CLI + Python one-liners:** `tc.compress` / `tc.benchmark_tensor` / `tensorcache benchmark`.
 
 ---

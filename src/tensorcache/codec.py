@@ -1335,11 +1335,11 @@ RCT_GAIN_C = 0.69
 # Tunable presets: q_scale, lamb  (lamb trades D vs R in RDO)
 # Measured on 16x COCO val 336^2 with sparse bitstream (PSNR dB / actual ratio):
 WAVELET_ADAPTIVE_PRESETS = {
-    "ultra":      (1.0, 1.0),   # ~44.8dB 2.99x highest fidelity (4:4:4)
-    "high":       (3.0, 5.0),   # ~40.1dB 4.98x balanced high quality (4:4:4)
-    "balanced":   (3.0, 10.0),  # ~37.0dB 6.94x default (4:2:0)
-    "compress":   (5.0, 20.0),  # ~35.5dB 8.72x high compress (4:2:0)
-    "ultra_comp": (8.0, 50.0),  # ~33.1dB 12.1x max compress (4:2:0)
+    "ultra":      (1.0, 1.0),   # ~44.4dB 3.22x highest fidelity (4:4:4)
+    "high":       (3.0, 5.0),   # ~39.8dB 5.57x balanced high quality (4:4:4)
+    "balanced":   (3.0, 10.0),  # ~36.8dB 7.80x default (4:2:0)
+    "compress":   (5.0, 20.0),  # ~35.3dB 9.76x high compress (4:2:0)
+    "ultra_comp": (8.0, 50.0),  # ~33.0dB 13.6x max compress (4:2:0)
 }
 
 def _pack_4b(idx: torch.Tensor) -> torch.Tensor:
@@ -1399,12 +1399,13 @@ def _quant_adaptive_plane(
     cand_q = torch.round(blocks.unsqueeze(1) / steps).clamp(-128, 127)
     cand_rec = cand_q * steps
     D = ((blocks.unsqueeze(1) - cand_rec) ** 2).sum(-1) * gain  # [M,C]
-    nnz = (cand_q != 0).sum(-1).float()  # [M,C]
+    nz = (cand_q != 0)  # [M,C,G] bool (reused for nnz + nibble counts)
+    nnz = nz.sum(-1).float()  # [M,C]
     if G == 32:
         # True hierarchical-mask price: 1 occ bit; empty blocks stop there.
         # Occupied: +1 mode bit + min(32 flat, 8+4k hier) mask bits + 4 idx + 8/coeff,
         # k = #nonempty nibbles (hier wins iff k<=5).
-        k = (cand_q.view(M, C, 8, 4) != 0).any(-1).sum(-1).float()  # [M,C]
+        k = nz.view(M, C, 8, 4).any(-1).sum(-1).float()  # [M,C]
         maskbits = torch.where(k <= 5, 8.0 + 4.0 * k, torch.full_like(k, 32.0))
         R = torch.where(nnz == 0, torch.ones_like(nnz), 6.0 + maskbits + 8.0 * nnz)
     else:
