@@ -2011,13 +2011,110 @@ def sparse_unpack_meta_gpu(sparse: dict, device: str | torch.device) -> dict:
     return out
 
 
+def sparse_pack_arena(sparse: dict) -> dict:
+    """Repackage a sparse bitstream dict into the arena stored format.
+
+    The arena IS the decode-ready layout: one concatenated u8 stream blob,
+    one i8 vals blob, a [P,8] int32 meta table of per-plane stream offsets,
+    and raw int16 LL4 — so the decode-side plan is ~zero CPU (concat + H2D).
+    Pure CPU torch, no syncs (all lengths are tensor metadata).
+
+    meta cols: 0 occ, 1 mode, 2 fmask, 3 hflags, 4 vals, 5 idx, 6 param, 7 hnib.
+    inv entries: (name, channel, h, w, M); static names normalized ('LH4').
+    """
+    adaptive = bool(sparse.get("adaptive", False))
+    inv = []  # fixed plane order: channel-major
+    for c, ch in enumerate(sparse["channels"]):
+        if adaptive:
+            names = [n for n in ("LH4", "HL4", "HH4", "LH3", "HL3", "HH3",
+                                 "LH2", "HL2", "HH2", "LH1", "HL1", "HH1") if n in ch]
+            for n in names:
+                p = ch[n]
+                h, w = tuple(p["shape"])
+                inv.append((n, c, h, w, int(p["M"])))
+        else:
+            for lvl in ("L4", "L3", "L2", "L1"):
+                if lvl not in ch:
+                    continue
+                for pn in ("LH", "HL", "HH"):
+                    p = ch[lvl]["planes"][pn]
+                    h, w = tuple(p["shape"])
+                    inv.append((pn + lvl[1:], c, h, w, int(p["M"])))
+    P = len(inv)
+    meta = torch.zeros((P, 8), dtype=torch.int32)
+    au8, ai8 = [], []
+    ll4_parts = [ch["LL4"].to(torch.int16).reshape(-1) for ch in sparse["channels"]]
+    ll4_shapes = [tuple(ch["LL4"].shape) for ch in sparse["channels"]]
+    ou = oi = 0
+    for i, (name, c, h, w, M) in enumerate(inv):
+        ch = sparse["channels"][c]
+        if adaptive:
+            op, ip, param = ch[name], ch[name]["idx_packed"], int(ch[name]["bq"])
+        else:
+            lvl, pn = "L" + name[2:], name[:2]
+            e = ch[lvl]
+            op, ip = e["planes"][pn], None
+            param = int(e["q"]) * (2 if pn == "HH" else 1)
+        occ = op["occ"].reshape(-1)
+        mode = op["mode"].reshape(-1)
+        fmask = op["mask"].reshape(-1)
+        hfl = op["hflags"].reshape(-1)
+        hnib = op["hnib"].reshape(-1)
+        idx = ip.reshape(-1) if ip is not None else torch.zeros(0, dtype=torch.uint8)
+        vals = op["vals"].reshape(-1)
+        meta[i, 0] = ou
+        meta[i, 1] = ou + occ.numel()
+        meta[i, 2] = ou + occ.numel() + mode.numel()
+        meta[i, 3] = ou + occ.numel() + mode.numel() + fmask.numel()
+        meta[i, 7] = ou + occ.numel() + mode.numel() + fmask.numel() + hfl.numel()
+        meta[i, 4] = oi
+        meta[i, 6] = param
+        au8 += [occ, mode, fmask, hfl, hnib, idx]
+        ai8 += [vals]
+        ou = ou + occ.numel() + mode.numel() + fmask.numel() + hfl.numel() + hnib.numel() + idx.numel()
+        oi += vals.numel()
+        meta[i, 5] = ou - idx.numel()  # idx base
+    out = {
+        "format": "xs-arena-v1",
+        "adaptive": adaptive,
+        "orig_shape": tuple(sparse["orig_shape"]),
+        "pad_h": int(sparse["pad_h"]),
+        "pad_w": int(sparse["pad_w"]),
+        "inv": inv,
+        "B": sum(e[4] for e in inv),
+        "P": P,
+        "arena_u8": torch.cat(au8, dim=0) if au8 else torch.zeros(0, dtype=torch.uint8),
+        "arena_i8": torch.cat(ai8, dim=0).to(torch.int8) if ai8 else torch.zeros(0, dtype=torch.int8),
+        "meta": meta,
+        "ll4": torch.cat(ll4_parts, dim=0) if ll4_parts else torch.zeros(0, dtype=torch.int16),
+        "ll4_shapes": ll4_shapes,
+    }
+    if adaptive:
+        out["codebook"] = sparse["codebook"].to(torch.float32).reshape(-1)
+        out["q_scale"] = sparse.get("q_scale")
+        out["lamb"] = sparse.get("lamb")
+        out["mode"] = sparse.get("mode")
+    return out
+
+
+def arena_nbytes(arena: dict) -> int:
+    """Actual stored bytes of an arena dict (tensors only)."""
+    return (arena["arena_u8"].nelement() + arena["arena_i8"].nelement()
+            + arena["meta"].nelement() * 4 + arena["ll4"].nelement() * 2)
+
+
 def _plane_nbytes(p: dict) -> int:
     return (p["mask"].nelement() + p["hflags"].nelement() + p["hnib"].nelement()
             + p["mode"].nelement() + p["vals"].nelement() + p["occ"].nelement())
 
 
 def sparse_nbytes(sparse: dict) -> int:
-    """Actual stored bytes of a sparse dict (tensors only; header is tens of bytes)."""
+    """Actual stored bytes of a sparse dict (tensors only; header is tens of bytes).
+
+    Accepts arena dicts too (detected via the 'format' marker).
+    """
+    if sparse.get("format") == "xs-arena-v1":
+        return arena_nbytes(sparse)
     total = 0
     for ch in sparse["channels"]:
         total += ch["LL4"].nelement() * 2

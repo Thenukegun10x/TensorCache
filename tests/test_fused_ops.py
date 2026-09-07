@@ -156,12 +156,13 @@ def test_fused_wavelet8x_gpu():
 @pytest.mark.skipif(not GPU_AVAILABLE, reason="Functional CUDA/ROCm GPU + Triton required for Triton kernels")
 def test_sparse_wavelet_decode_gpu():
     """Mega-kernel sparse decode is bit-exact vs the CPU sparse reference
-    (adaptive 4:4:4 + 4:2:0 and the static schema)."""
+    (adaptive 4:4:4 + 4:2:0 and the static schema), via arenas and batches."""
     from tensorcache.codec import (
         quantize_pixel_wavelet_adaptive, quantize_pixel_wavelet8x,
         dequantize_pixel_wavelet_adaptive, dequantize_pixel_wavelet8x,
-        sparse_pack_meta, sparse_unpack_meta,
+        sparse_pack_meta, sparse_unpack_meta, sparse_pack_arena,
     )
+    from tensorcache.fused_ops import dequantize_sparse_wavelet_batch_gpu
     device = "cuda:0"
     img = _natural_test_img(96, 96, seed=7)
     cases = []
@@ -174,8 +175,21 @@ def test_sparse_wavelet_decode_gpu():
         sp = sparse_pack_meta(m)
         ref = cpu_fn(sparse_unpack_meta(sp), device="cpu")
         got = dequantize_sparse_wavelet_gpu(sp, device=device)
-        assert torch.equal(ref, got.cpu()), name
-        print(f"\n[+] Sparse GPU decode {name}: bit-exact")
+        assert torch.equal(ref, got.cpu()), name + "-legacy"
+        arena = sparse_pack_arena(sp)
+        got_a = dequantize_sparse_wavelet_gpu(arena, device=device)
+        assert torch.equal(ref, got_a.cpu()), name + "-arena"
+        print(f"\n[+] Sparse GPU decode {name}: bit-exact (legacy + arena)")
+    # batched: 4x same ultra image, one launch
+    m, _ = quantize_pixel_wavelet_adaptive(img, mode="balanced")
+    sp = sparse_pack_meta(m)
+    ref = dequantize_pixel_wavelet_adaptive(sparse_unpack_meta(sp), device="cpu")
+    arenas = [sparse_pack_arena(sp) for _ in range(4)]
+    batch = dequantize_sparse_wavelet_batch_gpu(arenas, device=device)
+    assert batch.shape == (4, 96, 96, 3)
+    for i in range(4):
+        assert torch.equal(ref, batch[i].cpu()), f"batch-{i}"
+    print("\n[+] Sparse GPU batch-4 decode: bit-exact")
 
 
 if __name__ == "__main__":

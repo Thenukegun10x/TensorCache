@@ -794,88 +794,24 @@ if HAS_TRITON:
 
     _xs_decode_cache: dict = {}
 
-    def _xs_decode_plan(sparse: dict):
-        """CPU-side plan: inventory + cached GPU index tables + per-image arena.
-
-        Returns (cache_entry, arena_u8_cpu, arena_i8_cpu, meta_cpu, ll4_cpu).
-        No syncs: all lengths are CPU-known tensor metadata.
-        """
-        adaptive = bool(sparse.get("adaptive", False))
-        # Fixed plane order: channel-major (matches dense schema stacking below)
-        inv = []  # (name, ch, h, w, M); static names normalized to adaptive style ('LH4')
-        for c, ch in enumerate(sparse["channels"]):
-            if adaptive:
-                names = [n for n in ("LH4", "HL4", "HH4", "LH3", "HL3", "HH3",
-                                     "LH2", "HL2", "HH2", "LH1", "HL1", "HH1") if n in ch]
-                for n in names:
-                    p = ch[n]
-                    h, w = tuple(p["shape"])
-                    inv.append((n, c, h, w, int(p["M"])))
-            else:
-                for lvl in ("L4", "L3", "L2", "L1"):
-                    if lvl not in ch:
-                        continue
-                    for pn in ("LH", "HL", "HH"):
-                        p = ch[lvl]["planes"][pn]
-                        h, w = tuple(p["shape"])
-                        inv.append((pn + lvl[1:], c, h, w, int(p["M"])))
-        key = (adaptive, tuple(sparse["orig_shape"]), tuple(inv))
+    def _xs_pattern_tables(inv, B, P, key):
+        """Cached per-config block index tables (CPU): plane id + block id."""
         ent = _xs_decode_cache.get(key)
-        P = len(inv)
-        pstart = [0]
-        for e in inv:
-            pstart.append(pstart[-1] + e[4])
-        B = pstart[-1]
-        # Per-image arena (u8 streams, i8 vals) + meta rows.
-        # meta cols: 0 occ, 1 mode, 2 fmask, 3 hflags, 4 vals, 5 idx, 6 param, 7 hnib
-        meta = torch.zeros((P, 8), dtype=torch.int32)
-        au8, ai8 = [], []
-        ll4_parts = [ch["LL4"].to(torch.int16).reshape(-1) for ch in sparse["channels"]]
-        ou = oi = 0
-        for i, (name, c, h, w, M) in enumerate(inv):
-            ch = sparse["channels"][c]
-            if adaptive:
-                op, ip, param = ch[name], ch[name]["idx_packed"], int(ch[name]["bq"])
-            else:
-                lvl, pn = "L" + name[2:], name[:2]
-                e = ch[lvl]
-                op, ip = e["planes"][pn], None
-                param = int(e["q"]) * (2 if pn == "HH" else 1)
-            occ = op["occ"].reshape(-1)
-            mode = op["mode"].reshape(-1)
-            fmask = op["mask"].reshape(-1)
-            hfl = op["hflags"].reshape(-1)
-            hnib = op["hnib"].reshape(-1)
-            idx = ip.reshape(-1) if ip is not None else torch.zeros(0, dtype=torch.uint8)
-            vals = op["vals"].reshape(-1)
-            meta[i, 0] = ou
-            meta[i, 1] = ou + occ.numel()
-            meta[i, 2] = ou + occ.numel() + mode.numel()
-            meta[i, 3] = ou + occ.numel() + mode.numel() + fmask.numel()
-            meta[i, 7] = ou + occ.numel() + mode.numel() + fmask.numel() + hfl.numel()
-            meta[i, 4] = oi
-            meta[i, 5] = -1  # idx base placeholder (fixed below)
-            meta[i, 6] = param
-            au8 += [occ, mode, fmask, hfl, hnib, idx]
-            ai8 += [vals]
-            ou = ou + occ.numel() + mode.numel() + fmask.numel() + hfl.numel() + hnib.numel() + idx.numel()
-            oi += vals.numel()
-            meta[i, 5] = ou - idx.numel()  # idx base
-        arena_u8 = torch.cat(au8, dim=0) if au8 else torch.zeros(0, dtype=torch.uint8)
-        arena_i8 = torch.cat(ai8, dim=0).to(torch.int8) if ai8 else torch.zeros(0, dtype=torch.int8)
-        ll4 = torch.cat(ll4_parts, dim=0) if ll4_parts else torch.zeros(0, dtype=torch.int16)
         if ent is None:
             plane = torch.zeros(B, dtype=torch.int32)
             blk = torch.zeros(B, dtype=torch.int32)
+            pstarts = [0]
+            for (name, c, h, w, M) in inv:
+                pstarts.append(pstarts[-1] + M)
             for i, (name, c, h, w, M) in enumerate(inv):
-                s = pstart[i]
+                s = pstarts[i]
                 plane[s:s + M] = i
                 blk[s:s + M] = torch.arange(M, dtype=torch.int32)
             ent = {"plane": plane, "blk": blk,
-                   "pstart": torch.tensor(pstart, dtype=torch.int32),
-                   "inv": inv, "B": B, "P": P}
+                   "pstart": torch.tensor(pstarts, dtype=torch.int32),
+                   "B": B, "P": P}
             _xs_decode_cache[key] = ent
-        return ent, arena_u8, arena_i8, meta, ll4
+        return ent
 
     def _synthesize_wavelet_planes_gpu(LL4, rec_planes, sub, H, W, out_buffer=None):
         # Shared synthesis: 4-stage IDWT chain(s) + fused RCT store.
@@ -929,80 +865,188 @@ if HAS_TRITON:
             return out_buffer
         return rec_rgb
 
+    def _xs_ensure_arena(sparse: dict) -> dict:
+        """Accept arena (stored format) or legacy sparse dict (converted on the fly)."""
+        if sparse.get("format") == "xs-arena-v1":
+            return sparse
+        from .codec import sparse_pack_arena
+        return sparse_pack_arena(sparse)
+
+    def _synthesize_wavelet_batch_gpu(LL4b, recb, sub, H, W):
+        """Batched synthesis [N,3,h4,w4] + rec planes -> [N,H,W,3] uint8 (torch, bit-exact).
+
+        Uses the same integer lifting as the Triton single path, but with the
+        batch folded into the leading dims so one launch covers all images.
+        """
+        from .codec import _idwt_53_2d_step_batched, _upsample2, rct_inverse
+
+        def _idwt4(LL, LH, HL, HH):
+            # [N,k,h,w] -> [N,k,2h,2w] via flattened 3D IDWT (F.pad needs 3D)
+            N, k, h, w = LL.shape
+            r = _idwt_53_2d_step_batched(
+                LL.reshape(N * k, h, w), LH.reshape(N * k, h, w),
+                HL.reshape(N * k, h, w), HH.reshape(N * k, h, w))
+            return r.view(N, k, r.shape[-2], r.shape[-1])
+
+        if not sub:
+            rec_ll3 = _idwt4(LL4b, recb['LH4'], recb['HL4'], recb['HH4'])
+            rec_ll2 = _idwt4(rec_ll3, recb['LH3'], recb['HL3'], recb['HH3'])
+            rec_ll1 = _idwt4(rec_ll2, recb['LH2'], recb['HL2'], recb['HH2'])
+            rec_yuv_b = _idwt4(rec_ll1, recb['LH1'], recb['HL1'], recb['HH1'])
+        else:
+            rec_ll3 = _idwt4(LL4b, recb['LH4'], recb['HL4'], recb['HH4'])
+            rec_ll2_y = _idwt4(rec_ll3[:, 0:1], recb['LH3'][:, 0:1], recb['HL3'][:, 0:1], recb['HH3'][:, 0:1])
+            rec_ll2_c = _idwt4(rec_ll3[:, 1:3], recb['LH3'][:, 1:3], recb['HL3'][:, 1:3], recb['HH3'][:, 1:3])
+            rec_ll1_y = _idwt4(rec_ll2_y, recb['LH2'][:, 0:1], recb['HL2'][:, 0:1], recb['HH2'][:, 0:1])
+            rec_c_half = _idwt4(rec_ll2_c, recb['LH2'][:, 1:3], recb['HL2'][:, 1:3], recb['HH2'][:, 1:3])
+            rec_y = _idwt4(rec_ll1_y, recb['LH1'], recb['HL1'], recb['HH1'])
+            rec_yuv_b = torch.cat([rec_y, _upsample2(rec_c_half)], dim=1)
+        rec_yuv = rec_yuv_b.permute(0, 2, 3, 1)
+        rec_rgb_full = rct_inverse(rec_yuv)
+        return rec_rgb_full[:, :H, :W, :]
+
+    def dequantize_sparse_wavelet_batch_gpu(
+        arenas: list,
+        device: str | torch.device = "cuda:0",
+    ) -> torch.Tensor:
+        """Batched GPU decode from arena dicts (or legacy sparse dicts) -> [N,H,W,3] uint8.
+
+        All images must share orig_shape / adaptive / inv (fixed-size training
+        batches do). Concatenates arenas on CPU (2 cats + meta fixup), H2Ds
+        once (~7 transfers total), runs the K mega-kernels once over the
+        N*B block grid, then batched torch synthesis. Bit-exact vs CPU.
+        """
+        from .codec import ADAPTIVE_CODEBOOK
+        dev = torch.device(device)
+        assert len(arenas) >= 1, "empty batch"
+        arenas = [_xs_ensure_arena(a) for a in arenas]
+        a0 = arenas[0]
+        N = len(arenas)
+        H, W, _ = tuple(a0["orig_shape"])
+        adaptive = bool(a0.get("adaptive", False))
+        for a in arenas[1:]:
+            assert tuple(a["orig_shape"]) == (H, W, 3), "batch must share shape"
+            assert bool(a.get("adaptive", False)) == adaptive, "batch must share schema"
+            assert a["inv"] == a0["inv"], "batch must share plane layout"
+        inv = a0["inv"]
+        P, B = int(a0["P"]), int(a0["B"])
+        key_single = (adaptive, tuple(a0["orig_shape"]), tuple(inv))
+        pent = _xs_pattern_tables(inv, B, P, key_single)
+        plane_single = pent["plane"]
+        blk_single = pent["blk"]
+        pstart_single = pent["pstart"]
+        # Concat arenas + fixup meta offsets (CPU, no syncs)
+        au8_list, ai8_list, ll4_list, meta_rows = [], [], [], []
+        OU = OI = 0
+        for a in arenas:
+            au8_list.append(a["arena_u8"])
+            ai8_list.append(a["arena_i8"])
+            ll4_list.append(a["ll4"].to(torch.int16).reshape(-1))
+            m = a["meta"].clone()
+            for col in (0, 1, 2, 3, 7, 5):
+                m[:, col] += OU
+            m[:, 4] += OI
+            meta_rows.append(m)
+            OU += int(a["arena_u8"].numel())
+            OI += int(a["arena_i8"].numel())
+        arena_u8 = torch.cat(au8_list, dim=0)
+        arena_i8 = torch.cat(ai8_list, dim=0).to(torch.int8)
+        meta = torch.cat(meta_rows, dim=0)
+        ll4_flat = torch.cat(ll4_list, dim=0)
+        if N > 1:
+            plane_global = torch.cat([plane_single + n * P for n in range(N)], dim=0)
+            blk_global = torch.cat([blk_single] * N, dim=0)
+        else:
+            plane_global = plane_single
+            blk_global = blk_single
+        ps = pstart_single.tolist()
+        pstart_list = [0]
+        for n in range(N):
+            base = n * B
+            for i in range(P):
+                pstart_list.append(base + int(ps[i + 1]))
+        pstart_global = torch.tensor(pstart_list, dtype=torch.int32)
+        BT, PT = N * B, N * P
+        # H2D once
+        dplane = plane_global.to(dev, non_blocking=True)
+        dblk = blk_global.to(dev, non_blocking=True)
+        dpstart = pstart_global.to(dev, non_blocking=True)
+        darena = arena_u8.to(dev, non_blocking=True)
+        dvals = arena_i8.to(dev, non_blocking=True)
+        dmeta = meta.to(dev, non_blocking=True)
+        dll4 = ll4_flat.to(dev, non_blocking=True).to(torch.int32)
+        h4, w4 = tuple(a0["ll4_shapes"][0])
+        LL4b = dll4.view(N, 3, h4, w4)
+        if adaptive:
+            codebook = a0.get("codebook", ADAPTIVE_CODEBOOK).to(dev).float().reshape(-1)
+        else:
+            codebook = torch.zeros(16, dtype=torch.float32, device=dev)
+        BLOCK = 256
+        grid = (triton.cdiv(BT, BLOCK),)
+        occ = torch.empty(BT, dtype=torch.uint8, device=dev)
+        _xs_k0_occ[grid](dplane, dblk, darena, dmeta, occ, BT, BLOCK=BLOCK)
+        orank = occ.to(torch.int32).cumsum(0) - 1
+        mode = torch.empty(BT, dtype=torch.uint8, device=dev)
+        fsel = torch.empty(BT, dtype=torch.uint8, device=dev)
+        hsel = torch.empty(BT, dtype=torch.uint8, device=dev)
+        _xs_k1a_mode[grid](dplane, dblk, dpstart, darena, dmeta, occ, orank,
+                           mode, fsel, hsel, BT, BLOCK=BLOCK)
+        frank = fsel.to(torch.int32).cumsum(0) - 1
+        hrank = hsel.to(torch.int32).cumsum(0) - 1
+        word = torch.zeros(BT, dtype=torch.int32, device=dev)
+        kval = torch.zeros(BT, dtype=torch.int32, device=dev)
+        presb = torch.zeros(BT, dtype=torch.int32, device=dev)
+        hidx = torch.zeros(BT, dtype=torch.int32, device=dev)
+        _xs_k1b_words[grid](dplane, dblk, dpstart, darena, dmeta, occ, mode,
+                            orank, frank, hrank, word, kval, presb, hidx, BT,
+                            BLOCK=BLOCK)
+        niboff = kval.cumsum(0)
+        _xs_k1c_hier[grid](dplane, dpstart, darena, dmeta, occ, mode, presb,
+                           kval, niboff, word, BT, BLOCK=BLOCK)
+        ar32 = torch.arange(32, device=dev)
+        pop = (((word.unsqueeze(-1) >> ar32) & 1).sum(-1).to(torch.int32))
+        voff = pop.cumsum(0)
+        out = torch.empty(BT * 32, dtype=torch.int32, device=dev)
+        _xs_k2_gather[grid](dplane, dblk, dpstart, darena, dvals, dmeta, occ,
+                            word, pop, voff, codebook, out, BT, ADAPTIVE=adaptive,
+                            BLOCK=BLOCK)
+        # Split into batched rec planes [N,k,h,w] per name
+        name_to_entries: dict = {}
+        for i, (name, c, h, w, M) in enumerate(inv):
+            name_to_entries.setdefault(name, []).append((i, h, w))
+        recb: dict = {}
+        for name, entries in name_to_entries.items():
+            h0, w0 = entries[0][1], entries[0][2]
+            per_img = []
+            for n in range(N):
+                base_out = n * B * 32
+                ch_lst = []
+                for (i, h, w) in entries:
+                    assert h == h0 and w == w0
+                    s = base_out + int(ps[i]) * 32
+                    ch_lst.append(out[s:s + h * w].view(h, w))
+                per_img.append(torch.stack(ch_lst, dim=0))
+            recb[name] = torch.stack(per_img, dim=0)
+        sub = not any((nm == "LH1" and cc == 1) for (nm, cc, hh, ww, MM) in inv)
+        return _synthesize_wavelet_batch_gpu(LL4b, recb, sub, H, W)
+
     def dequantize_sparse_wavelet_gpu(
         sparse: dict,
         device: str | torch.device = "cuda:0",
         out_buffer: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Full GPU decode straight from the sparse bitstream dict (no CPU round-trip).
+        """Single-image GPU decode (batch-of-1 fast path).
 
-        Builds one u8 arena + i8 vals arena + meta table on CPU (no syncs),
-        H2Ds them in 4 transfers, then runs whole-image mega-kernels
-        (K0/K1a/K1b/K1c/K2, one program per 32-elem block across ALL planes)
-        with concatenated torch cumsums for ranks. Handles adaptive and
-        static schemas. Bit-exact vs the CPU sparse reference path.
+        Accepts the stored arena format directly (zero decode-side plan) or a
+        legacy sparse dict (converted on the fly). Bit-exact vs CPU reference.
         """
-        from .codec import ADAPTIVE_CODEBOOK
-        dev = torch.device(device)
-        H, W, _ = tuple(sparse["orig_shape"])
-        adaptive = bool(sparse.get("adaptive", False))
-        sub = ("LH1" not in sparse["channels"][1]) if adaptive \
-            else ("L1" not in sparse["channels"][1])
-        ent, arena_u8, arena_i8, meta, ll4 = _xs_decode_plan(sparse)
-        B, P = ent["B"], ent["P"]
-        inv = ent["inv"]
-        dplane = ent["plane"].to(dev, non_blocking=True)
-        dblk = ent["blk"].to(dev, non_blocking=True)
-        dpstart = ent["pstart"].to(dev, non_blocking=True)
-        darena = arena_u8.to(dev, non_blocking=True)
-        dvals = arena_i8.to(dev, non_blocking=True)
-        dmeta = meta.to(dev, non_blocking=True)
-        dll4 = ll4.to(dev, non_blocking=True).to(torch.int32)
-        h4, w4 = tuple(sparse["channels"][0]["LL4"].shape)
-        LL4 = dll4.view(3, h4, w4)
-        codebook = sparse.get("codebook", ADAPTIVE_CODEBOOK).to(dev).float() \
-            if adaptive else torch.zeros(16, dtype=torch.float32, device=dev)
-        BLOCK = 256
-        grid = (triton.cdiv(B, BLOCK),)
-        occ = torch.empty(B, dtype=torch.uint8, device=dev)
-        _xs_k0_occ[grid](dplane, dblk, darena, dmeta, occ, B, BLOCK=BLOCK)
-        orank = occ.to(torch.int32).cumsum(0) - 1
-        mode = torch.empty(B, dtype=torch.uint8, device=dev)
-        fsel = torch.empty(B, dtype=torch.uint8, device=dev)
-        hsel = torch.empty(B, dtype=torch.uint8, device=dev)
-        _xs_k1a_mode[grid](dplane, dblk, dpstart, darena, dmeta, occ, orank,
-                           mode, fsel, hsel, B, BLOCK=BLOCK)
-        frank = fsel.to(torch.int32).cumsum(0) - 1
-        hrank = hsel.to(torch.int32).cumsum(0) - 1
-        word = torch.zeros(B, dtype=torch.int32, device=dev)
-        kval = torch.zeros(B, dtype=torch.int32, device=dev)
-        presb = torch.zeros(B, dtype=torch.int32, device=dev)
-        hidx = torch.zeros(B, dtype=torch.int32, device=dev)
-        _xs_k1b_words[grid](dplane, dblk, dpstart, darena, dmeta, occ, mode,
-                            orank, frank, hrank, word, kval, presb, hidx, B,
-                            BLOCK=BLOCK)
-        ar32 = torch.arange(32, device=dev)
-        niboff = kval.cumsum(0)
-        _xs_k1c_hier[grid](dplane, dpstart, darena, dmeta, occ, mode, presb,
-                           kval, niboff, word, B, BLOCK=BLOCK)
-        # pop/voff AFTER K1c: hier words are only valid now
-        pop = (((word.unsqueeze(-1) >> ar32) & 1).sum(-1).to(torch.int32))
-        voff = pop.cumsum(0)
-        out = torch.empty(B * 32, dtype=torch.int32, device=dev)
-        _xs_k2_gather[grid](dplane, dblk, dpstart, darena, dvals, dmeta, occ,
-                            word, pop, voff, codebook, out, B, ADAPTIVE=adaptive,
-                            BLOCK=BLOCK)
-        # Views per plane (no copies) -> stacked level tensors for synthesis
-        pstart_cpu = ent["pstart"].tolist()
-        rec_planes = {}
-        per_name: dict = {}
-        for i, (name, c, h, w, M) in enumerate(inv):
-            s = pstart_cpu[i] * 32
-            v = out[s:s + h * w].view(h, w)
-            per_name.setdefault(name, []).append(v)
-        for name, lst in per_name.items():
-            rec_planes[name] = torch.stack(lst, dim=0)
-        return _synthesize_wavelet_planes_gpu(LL4, rec_planes, sub, H, W, out_buffer)
+        batch = dequantize_sparse_wavelet_batch_gpu([sparse], device=device)
+        rec = batch[0]
+        if out_buffer is not None:
+            out_buffer.copy_(rec)
+            return out_buffer
+        return rec
+
 
     def dequantize_fused_wavelet_adaptive_gpu(
         packed_meta: dict,
@@ -1240,17 +1284,29 @@ else:
 
     def dequantize_sparse_wavelet_gpu(sparse, device="cpu", out_buffer=None):
         # No Triton: unpack on target device with sync-free torch, then CPU/GPU
-        # reference synthesis via dense rebuild.
-        from .codec import sparse_unpack_meta_gpu, dequantize_pixel_wavelet_adaptive
+        # reference synthesis via dense rebuild. Arenas convert via sparse dict.
+        from .codec import sparse_unpack_meta_gpu, dequantize_pixel_wavelet_adaptive, sparse_pack_arena
         import torch as _torch
         dev = _torch.device(device)
         if dev.type in ("cuda", "hip"):
             raise RuntimeError("dequantize_sparse_wavelet_gpu requires Triton + CUDA/ROCm")
+        if sparse.get("format") == "xs-arena-v1":
+            raise RuntimeError("CPU fallback needs legacy sparse dicts; convert at encode time")
         dense = sparse_unpack_meta_gpu(sparse, dev)
         if sparse.get("adaptive", False):
             return dequantize_pixel_wavelet_adaptive(dense, device=device, out_buffer=out_buffer)
         from .codec import dequantize_pixel_wavelet8x
         return dequantize_pixel_wavelet8x(dense, device=device, out_buffer=out_buffer)
+
+    def dequantize_sparse_wavelet_batch_gpu(arenas, device="cpu"):
+        import torch as _torch
+        dev = _torch.device(device)
+        if dev.type in ("cuda", "hip"):
+            raise RuntimeError("dequantize_sparse_wavelet_batch_gpu requires Triton + CUDA/ROCm")
+        outs = []
+        for a in arenas:
+            outs.append(dequantize_sparse_wavelet_gpu(a, device=device))
+        return _torch.stack(outs, dim=0)
 
     _fused_quant_kernel = None
     _fused_amo_quant_kernel = None
