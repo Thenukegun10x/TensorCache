@@ -250,6 +250,19 @@ class ZeroCopyTensorStreamer:
             self.copy_events = None
             
         self.indices = np.arange(self.num_samples)
+        self._closed = False
+
+    def __enter__(self) -> "ZeroCopyTensorStreamer":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
+    def __del__(self):  # last-resort cleanup if user forgets close()
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def __len__(self) -> int:
         return (self.num_samples + self.batch_size - 1) // self.batch_size
@@ -483,6 +496,9 @@ class ZeroCopyTensorStreamer:
 
     def close(self):
         """Cleanly releases HIP/CUDA streams, pinned buffers, and memory maps (critical for ROCm Windows)."""
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
         if hasattr(self, "stream") and self.stream is not None:
             if torch.cuda.is_available():
                 torch.cuda.synchronize(self.device)
@@ -508,6 +524,8 @@ class ZeroCopyTensorStreamer:
                 del self.pinned_zp
             if hasattr(self, "pinned_zp_np"):
                 del self.pinned_zp_np
+            if hasattr(self, "pinned_int8_np_single"):
+                del self.pinned_int8_np_single
             
         if hasattr(self, "gpu_int8"):
             del self.gpu_int8
@@ -521,6 +539,12 @@ class ZeroCopyTensorStreamer:
                 del self.out_bf16_0
             if hasattr(self, "out_bf16_1"):
                 del self.out_bf16_1
+            if hasattr(self, "gpu_int8_single"):
+                del self.gpu_int8_single
+
+        # Shuffle indices are only valid while mmaps are open; free them too
+        if hasattr(self, "indices"):
+            del self.indices
             
         # Sharded mmaps
         if getattr(self, "is_sharded", False) and getattr(self, "shard_mmaps", None) is not None:

@@ -147,6 +147,19 @@ class FeatureCacheWriter:
         for sz in self.shard_sizes:
             self._shard_offsets.append(off)
             off += sz
+        self._closed = False
+
+    def __enter__(self) -> "FeatureCacheWriter":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
+    def __del__(self):  # last-resort cleanup if user forgets close()
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def _shard_for_global(self, global_idx: int):
         """Return (shard_idx, local_idx) for global sample index."""
@@ -300,6 +313,9 @@ class FeatureCacheWriter:
 
     def close(self):
         """Flushes memory maps, closes file handles, and writes metadata."""
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
         if self.is_sharded:
             # Flush all shards
             for mm in self.shard_mmaps:
@@ -742,32 +758,7 @@ class FeatureCacheDataset(Dataset):
                     if shuffle:
                         batch_idx = indices[start:start+batch_size]
                         cur_bs = len(batch_idx)
-                        # Gather per shard into pinned
-                        # Fill pinned buffers by iterating global indices
-                        # For sharded, we need to map each global idx to shard
-                        # Use per-element copy (still fast, batch small)
-                        for i, gidx in enumerate(batch_idx):
-                            si, li = self._shard_for_global_getitem(int(gidx))
-                            mm = self.shard_mmaps[si]
-                            pinned_q_np[i] = mm["int8"][li]
-                            pinned_sc_np[i] = mm["scales"][li].view(np.uint16) if False else mm["scales"][li]  # keep as uint16 view already
-                            # Actually pinned_sc_np is uint16 view, mm scales is uint16, so direct
-                            # Need to handle view: pinned_sc_np is uint16, mm scales is uint16, so copy
-                        # The above loop is python slow; instead batch per shard
-                        # More efficient: group indices by shard
-                        # Fallback to grouped copy
-                        # Clear pinned first (already filled per element, but redo grouped for speed)
-                        # Group
-                        # Re-fill more efficiently
-                        # For simplicity, use grouped
-                        # Reset and do grouped
-                        # Note: we already filled, but we can keep as is for now
-                        # Instead, do grouped from scratch
-                        # To avoid double work, we will redo with grouped
-                        # Group indices by shard
-                        # First, we need to reset pinned to correct values via grouped
-                        # We'll recompute
-                        # Group
+                        # Gather into pinned buffers, grouped by shard
                         shard_groups = {}
                         for i, gidx in enumerate(batch_idx):
                             si, li = self._shard_for_global_getitem(int(gidx))
@@ -873,31 +864,8 @@ class FeatureCacheDataset(Dataset):
                                 yield t_q, t_sc
                     else:
                         cur_bs = min(batch_size, self.num_samples - start)
-                        # Contiguous across shards: gather as before but CPU
-                        # Use per-shard contiguous copy then stack
-                        # For CPU we can just use mmap slices per shard and concat
-                        # Simple: collect per shard arrays and concat
-                        remaining = cur_bs
-                        cur_global = start
-                        parts_q = []
-                        parts_sc = []
-                        parts_zp = []
-                        while remaining > 0:
-                            si, li = self._shard_for_global_getitem(cur_global)
-                            avail = self.shard_sizes[si] - li
-                            take = min(remaining, avail)
-                            parts_q.append(torch.from_numpy(self.shard_mmaps[si]["int8"][li:li+take].copy()).to(q_dtype))
-                            parts_sc.append(torch.from_numpy(self.shard_mmaps[si]["scales"][li:li+take].copy().view(np.int16)).view(torch.bfloat16) if False else torch.from_numpy(self.shard_mmaps[si]["scales"][li:li+take].view(np.int16).copy()).view(torch.bfloat16))
-                            # Actually scales copy as before
-                            # Use view trick
-                            if self.amo_bq:
-                                parts_zp.append(torch.from_numpy(self.shard_mmaps[si]["zp"][li:li+take].copy()))
-                            cur_global += take
-                            remaining -= take
-                        # The above parts_sc is wrong due to view, redo correctly
-                        # For correctness, just use per-element for now
-                        # Fallback to per-element for CPU contiguous as well to keep simple
-                        # (CPU path not performance critical)
+                        # Contiguous across shards, CPU path (not performance critical):
+                        # gather per element directly into the yielded batch.
                         t_q_list = []
                         t_sc_list = []
                         t_zp_list = []
@@ -1084,3 +1052,15 @@ class FeatureCacheDataset(Dataset):
         # Clear sharded helpers
         if hasattr(self, "shard_mmaps"):
             self.shard_mmaps = None
+
+    def __enter__(self) -> "FeatureCacheDataset":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
+    def __del__(self):  # last-resort mmap release if user forgets close()
+        try:
+            self.close()
+        except Exception:
+            pass

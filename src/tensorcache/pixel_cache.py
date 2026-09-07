@@ -97,6 +97,19 @@ class PixelCacheWriter:
             )
             self.mmap_pixels = None
         self.current_idx = 0
+        self._closed = False
+
+    def __enter__(self) -> "PixelCacheWriter":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
+    def __del__(self):  # last-resort cleanup if user forgets close()
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def _quantize_blockwise(self, arr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Quantize uint8 [H,W,C] -> packed q bytes + scales BF16. Returns (q_packed uint8, scales uint16)."""
@@ -168,6 +181,9 @@ class PixelCacheWriter:
         self.current_idx += 1
 
     def close(self):
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
         if hasattr(self, "mmap_pixels") and self.mmap_pixels is not None:
             self.mmap_pixels.flush()
             if hasattr(self.mmap_pixels, "_mmap") and self.mmap_pixels._mmap is not None:
@@ -327,3 +343,15 @@ class PixelCacheDataset(Dataset):
                 self.mmap_scales._mmap.close()
             del self.mmap_scales
             self.mmap_scales = None
+
+    def __enter__(self) -> "PixelCacheDataset":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
+    def __del__(self):  # last-resort mmap release if user forgets close()
+        try:
+            self.close()
+        except Exception:
+            pass

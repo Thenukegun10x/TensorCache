@@ -49,7 +49,9 @@ class AsyncGPUPrefetcher:
     def _to_device_async(self, data: Any) -> Any:
         if torch.is_tensor(data):
             return data.to(self.device, non_blocking=True)
-        elif isinstance(data, (list, tuple)):
+        elif isinstance(data, tuple):
+            return tuple(self._to_device_async(item) for item in data)
+        elif isinstance(data, list):
             return [self._to_device_async(item) for item in data]
         elif isinstance(data, dict):
             return {k: self._to_device_async(v) for k, v in data.items()}
