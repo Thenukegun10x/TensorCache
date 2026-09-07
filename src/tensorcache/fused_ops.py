@@ -827,9 +827,16 @@ if HAS_TRITON:
                 plane[s:s + M] = i
                 blk[s:s + M] = torch.arange(M, dtype=torch.int32)
                 obase[s:s + M] = hw_off[i] + torch.arange(M, dtype=torch.int32) * 32
+            gather_spec: dict = {}
+            for i, (name, c, h, w, M) in enumerate(inv):
+                e = gather_spec.setdefault(name, {"h": h, "w": w, "off": []})
+                assert e["h"] == h and e["w"] == w  # same shape across channels
+                e["off"].append(hw_off[i])
+            spec = {name: (e["h"], e["w"], tuple(e["off"]))
+                    for name, e in gather_spec.items()}
             ent = {"plane": plane, "blk": blk, "obase": obase, "phw": phw,
                    "pstart": torch.tensor(pstarts, dtype=torch.int32),
-                   "hw_off": hw_off, "HWsum": hw_off[-1],
+                   "hw_off": hw_off, "HWsum": hw_off[-1], "gather_spec": spec,
                    "B": B, "P": P}
             _xs_decode_cache[key] = ent
         return ent
@@ -975,14 +982,20 @@ if HAS_TRITON:
         from .codec import sparse_pack_arena
         return sparse_pack_arena(sparse)
 
-    def _synthesize_wavelet_batch_eager(LL4b, recb, sub, H, W):
-        """Batched synthesis [N,3,h4,w4] + rec planes -> [N,H,W,3] uint8 (torch, bit-exact).
+    def _gather_synth_eager(out, LL4b, spec, sub, H, W, HWsum, N):
+        """Packed planes -> [N,H,W,3] uint8, one compiled region (torch, bit-exact).
 
-        Uses the same integer lifting as the Triton single path, but with the
-        batch folded into the leading dims so one launch covers all images.
+        The per-name stacks live INSIDE: Inductor turns them into index math
+        inside the fused IDWT kernels, so the 43 MB restack copies + 12
+        launches vanish. Same integer lifting as the Triton single path.
         Pure tensor ops (no data-dependent Python) so torch.compile fuses it.
         """
         from .codec import _idwt_53_2d_step_batched, _upsample2, rct_inverse
+        recb: dict = {}
+        for name, (h0, w0, offs) in spec.items():
+            parts = [out[n * HWsum + o:n * HWsum + o + h0 * w0].view(h0, w0)
+                     for n in range(N) for o in offs]
+            recb[name] = torch.stack(parts, dim=0).view(N, len(offs), h0, w0)
 
         def _idwt4(LL, LH, HL, HH):
             # [N,k,h,w] -> [N,k,2h,2w] via flattened 3D IDWT (F.pad needs 3D)
@@ -1009,8 +1022,7 @@ if HAS_TRITON:
         rec_rgb_full = rct_inverse(rec_yuv)
         return rec_rgb_full[:, :H, :W, :]
 
-    _synthesize_wavelet_batch_gpu = _maybe_compile(
-        _synthesize_wavelet_batch_eager, "xs_synth")
+    _gather_synth = _maybe_compile(_gather_synth_eager, "xs_gather_synth")
     _popcount32 = _maybe_compile(_popcount32_eager, "xs_popcount")
 
     def dequantize_sparse_wavelet_batch_gpu(
@@ -1046,23 +1058,21 @@ if HAS_TRITON:
         gt = _xs_gpu_index_tables(key_single, N, dev, pent)
         dplane, dblk = gt["dplane"], gt["dblk"]
         dpstart, dobase, dphw = gt["dpstart"], gt["dobase"], gt["dphw"]
-        # Concat arenas + fixup meta offsets (CPU, no syncs)
-        au8_list, ai8_list, ll4_list, meta_rows = [], [], [], []
-        OU = OI = 0
-        for a in arenas:
-            au8_list.append(a["arena_u8"])
-            ai8_list.append(a["arena_i8"])
-            ll4_list.append(a["ll4"].to(torch.int16).reshape(-1))
-            m = a["meta"].clone()
-            for col in (0, 1, 2, 3, 7, 5):
-                m[:, col] += OU
-            m[:, 4] += OI
-            meta_rows.append(m)
-            OU += int(a["arena_u8"].numel())
-            OI += int(a["arena_i8"].numel())
+        # Concat arenas + fixup meta offsets (CPU, no syncs). The fixup is
+        # one stacked add (broadcast over [N,P]), not a per-arena clone loop.
+        au8_list = [a["arena_u8"] for a in arenas]
+        ai8_list = [a["arena_i8"] for a in arenas]
+        ll4_list = [a["ll4"].to(torch.int16).reshape(-1) for a in arenas]
+        u8len = torch.tensor([a.numel() for a in au8_list], dtype=torch.int32)
+        i8len = torch.tensor([a.numel() for a in ai8_list], dtype=torch.int32)
+        OU = (u8len.cumsum(0) - u8len).view(N, 1, 1)
+        OI = (i8len.cumsum(0) - i8len).view(N, 1, 1)
+        meta = torch.stack([a["meta"] for a in arenas], dim=0)  # [N,P,8]
+        meta[:, :, (0, 1, 2, 3, 7, 5)] += OU
+        meta[:, :, 4:5] += OI
+        meta = meta.view(N * P, 8)
         arena_u8 = torch.cat(au8_list, dim=0)
         arena_i8 = torch.cat(ai8_list, dim=0).to(torch.int8)
-        meta = torch.cat(meta_rows, dim=0)
         ll4_flat = torch.cat(ll4_list, dim=0)
         BT, PT = N * B, N * P
         # H2D: data only (index tables are cached on-device)
@@ -1109,23 +1119,8 @@ if HAS_TRITON:
         _xs_k2_gather[grid](dplane, dblk, dpstart, darena, dvals, dmeta, occ,
                             word, pop, voff, codebook, out, dobase, dphw,
                             BT, ADAPTIVE=adaptive, BLOCK=BLOCK)
-        # One stack per plane-name (views, single copy) -> [N,k,h,w]
-        name_to_entries: dict = {}
-        for i, (name, c, h, w, M) in enumerate(inv):
-            name_to_entries.setdefault(name, []).append((i, h, w))
-        recb: dict = {}
-        for name, entries in name_to_entries.items():
-            h0, w0 = entries[0][1], entries[0][2]
-            parts = []
-            for n in range(N):
-                base_out = n * HWsum
-                for (i, h, w) in entries:
-                    assert h == h0 and w == w0
-                    s = base_out + hw_off[i]
-                    parts.append(out[s:s + h * w].view(h, w))
-            recb[name] = torch.stack(parts, dim=0).view(N, len(entries), h0, w0)
         sub = not any((nm == "LH1" and cc == 1) for (nm, cc, hh, ww, MM) in inv)
-        return _synthesize_wavelet_batch_gpu(LL4b, recb, sub, H, W)
+        return _gather_synth(out, LL4b, pent["gather_spec"], sub, H, W, HWsum, N)
 
     def dequantize_sparse_wavelet_gpu(
         sparse: dict,
