@@ -12,6 +12,7 @@ from tensorcache.fused_ops import (
     dequantize_fused_int3_gpu,
     quantize_fused_wavelet8x_gpu,
     dequantize_fused_wavelet8x_gpu,
+    dequantize_sparse_wavelet_gpu,
     FusedDequantLinear,
     HAS_TRITON,
 )
@@ -152,6 +153,31 @@ def test_fused_wavelet8x_gpu():
     print(f"\n[+] Fused Wavelet 8x GPU Codec verified! PSNR: {psnr:.2f} dB, Rel RMSE: {rmse:.2f}%")
 
 
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Functional CUDA/ROCm GPU + Triton required for Triton kernels")
+def test_sparse_wavelet_decode_gpu():
+    """Mega-kernel sparse decode is bit-exact vs the CPU sparse reference
+    (adaptive 4:4:4 + 4:2:0 and the static schema)."""
+    from tensorcache.codec import (
+        quantize_pixel_wavelet_adaptive, quantize_pixel_wavelet8x,
+        dequantize_pixel_wavelet_adaptive, dequantize_pixel_wavelet8x,
+        sparse_pack_meta, sparse_unpack_meta,
+    )
+    device = "cuda:0"
+    img = _natural_test_img(96, 96, seed=7)
+    cases = []
+    for mode in ("ultra", "balanced"):
+        m, _ = quantize_pixel_wavelet_adaptive(img, mode=mode)
+        cases.append((f"adaptive-{mode}", m, dequantize_pixel_wavelet_adaptive))
+    ms, _ = quantize_pixel_wavelet8x(img, q_scale=3.0, chroma420=True)
+    cases.append(("static-q3-420", ms, dequantize_pixel_wavelet8x))
+    for name, m, cpu_fn in cases:
+        sp = sparse_pack_meta(m)
+        ref = cpu_fn(sparse_unpack_meta(sp), device="cpu")
+        got = dequantize_sparse_wavelet_gpu(sp, device=device)
+        assert torch.equal(ref, got.cpu()), name
+        print(f"\n[+] Sparse GPU decode {name}: bit-exact")
+
+
 if __name__ == "__main__":
     if GPU_AVAILABLE:
         test_fused_dequant_kernel()
@@ -159,6 +185,7 @@ if __name__ == "__main__":
         test_fused_dequant_int3_kernel()
         test_fused_dequant_linear()
         test_fused_wavelet8x_gpu()
+        test_sparse_wavelet_decode_gpu()
         print("\n[+] ALL FUSED KERNEL TESTS PASSED!")
     else:
         print("[-] Skipping: No functional CUDA/ROCm GPU + Triton detected.")

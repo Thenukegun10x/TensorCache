@@ -636,39 +636,254 @@ if HAS_TRITON:
         from .codec import quantize_pixel_wavelet_adaptive
         return quantize_pixel_wavelet_adaptive(img, q_scale=q_scale, lamb=lamb, G=G, mode=mode, chroma420=chroma420)
 
-    def dequantize_fused_wavelet_adaptive_gpu(
-        packed_meta: dict,
-        device: str | torch.device = "cuda:0",
-        out_buffer: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        dev = torch.device(device)
-        H, W, C = packed_meta['orig_shape']
-        G = packed_meta.get('G', 32)
-        from .codec import ADAPTIVE_CODEBOOK
-        codebook = packed_meta.get('codebook', ADAPTIVE_CODEBOOK).to(dev).float()
-        channels = packed_meta['channels']
-        # Build rec planes via Triton adaptive dequant + Triton IDWT
-        # L4/L3/L2 stack [3, ...] (Y + subsampled C); L1 is luma-only [1, ...]
-        LL4 = torch.stack([ch['LL4'].to(dev).to(torch.int32) for ch in channels], dim=0)
-        # For each plane, Triton dequant
-        plane_names = ["LH4","HL4","HH4","LH3","HL3","HH3","LH2","HL2","HH2","LH1","HL1","HH1"]
-        rec_planes = {}
-        rec_planes['LL4'] = LL4
-        for name in plane_names:
-            rec_list = []
-            for c in range(3):
-                ch = channels[c]
-                if name not in ch:
-                    continue  # chroma has no L1 under 4:2:0
-                q_plane, idx_packed, bq = ch[name]
-                q_plane = q_plane.to(dev)
-                idx_packed = idx_packed.to(dev)
-                rec = _launch_wavelet_adaptive_dequant(q_plane, idx_packed, bq, codebook, G)
-                rec_list.append(rec)
-            rec_planes[name] = torch.stack(rec_list, dim=0)
+    # -------------------------------------------------------------------------
+    # 2e. Sparse-bitstream GPU decode: whole-image mega-kernels (K0/K1a/K1b/K1c/K2)
+    # One program per 32-elem block across ALL planes (grid = total blocks B):
+    #   K0  occ byte bit -> occ_bits[B]
+    #   K1a occ_rank -> mode bit + flat/hier select
+    #   K1b flat_rank/hier_rank -> flat words; hier presence + k
+    #   K1c nib prefix -> hier words (8-iter in-register nibble gather)
+    #   K2  vals prefix + step -> int32 coeffs (in-register running count, no scatter)
+    # All inter-block ranks are single torch cusmums over concatenated [B]
+    # vectors; per-plane bases subtracted via the pstart table (no syncs).
+    # H2D is a single u8 arena + i8 vals arena + int16 LL4 + tiny meta table.
+    # -------------------------------------------------------------------------
+    @triton.jit
+    def _xs_k0_occ(plane_ptr, blk_ptr, arena_ptr, meta_ptr, occ_out, B,
+                   BLOCK: tl.constexpr):
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        m = offs < B
+        p = tl.load(plane_ptr + offs, mask=m, other=0)
+        b = tl.load(blk_ptr + offs, mask=m, other=0)
+        occ_base = tl.load(meta_ptr + p * 8 + 0, mask=m, other=0)
+        byte = tl.load(arena_ptr + occ_base + (b >> 3), mask=m, other=0).to(tl.int32)
+        bit = (byte >> (b & 7)) & 1
+        tl.store(occ_out + offs, bit.to(tl.uint8), mask=m)
+
+    @triton.jit
+    def _xs_k1a_mode(plane_ptr, blk_ptr, pstart_ptr, arena_ptr, meta_ptr,
+                     occ_ptr, orank_ptr, mode_out, fsel_out, hsel_out, B,
+                     BLOCK: tl.constexpr):
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        m = offs < B
+        p = tl.load(plane_ptr + offs, mask=m, other=0)
+        occ = tl.load(occ_ptr + offs, mask=m, other=0)
+        r = tl.load(orank_ptr + offs, mask=m, other=0).to(tl.int32)
+        ps = tl.load(pstart_ptr + p, mask=m, other=0)
+        base = tl.where(ps > 0, tl.load(orank_ptr + ps - 1, mask=m, other=0).to(tl.int32) + 1, 0)
+        r = r - base
+        mode_base = tl.load(meta_ptr + p * 8 + 1, mask=m, other=0)
+        mbyte = tl.load(arena_ptr + mode_base + (r >> 3),
+                        mask=m & (occ != 0), other=0).to(tl.int32)
+        mode = (((mbyte >> (r & 7)) & 1) & (occ != 0)).to(tl.uint8)
+        tl.store(mode_out + offs, mode, mask=m)
+        tl.store(fsel_out + offs, (occ & (mode ^ 1)).to(tl.uint8), mask=m)
+        tl.store(hsel_out + offs, (occ & mode).to(tl.uint8), mask=m)
+
+    @triton.jit
+    def _xs_k1b_words(plane_ptr, blk_ptr, pstart_ptr, arena_ptr, meta_ptr,
+                      occ_ptr, mode_ptr, orank_ptr, frank_ptr, hrank_ptr,
+                      word_out, k_out, presb_out, hidx_out, B,
+                      BLOCK: tl.constexpr):
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        m = offs < B
+        p = tl.load(plane_ptr + offs, mask=m, other=0)
+        b = tl.load(blk_ptr + offs, mask=m, other=0)
+        occ = tl.load(occ_ptr + offs, mask=m, other=0)
+        mode = tl.load(mode_ptr + offs, mask=m, other=0)
+        ps = tl.load(pstart_ptr + p, mask=m, other=0)
+        is_flat = (occ != 0) & (mode == 0)
+        is_hier = (occ != 0) & (mode != 0)
+        fr = tl.load(frank_ptr + offs, mask=m, other=0).to(tl.int32)
+        fbase = tl.where(ps > 0, tl.load(frank_ptr + ps - 1, mask=m, other=0).to(tl.int32) + 1, 0)
+        hr = tl.load(hrank_ptr + offs, mask=m, other=0).to(tl.int32)
+        hbase = tl.where(ps > 0, tl.load(hrank_ptr + ps - 1, mask=m, other=0).to(tl.int32) + 1, 0)
+        fmask_base = tl.load(meta_ptr + p * 8 + 2, mask=m, other=0)
+        hfl_base = tl.load(meta_ptr + p * 8 + 3, mask=m, other=0)
+        fi = fr - fbase
+        b0 = tl.load(arena_ptr + fmask_base + fi * 4 + 0, mask=m & is_flat, other=0).to(tl.int32)
+        b1 = tl.load(arena_ptr + fmask_base + fi * 4 + 1, mask=m & is_flat, other=0).to(tl.int32)
+        b2 = tl.load(arena_ptr + fmask_base + fi * 4 + 2, mask=m & is_flat, other=0).to(tl.int32)
+        b3 = tl.load(arena_ptr + fmask_base + fi * 4 + 3, mask=m & is_flat, other=0).to(tl.int32)
+        fword = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+        hi = hr - hbase
+        pres = tl.load(arena_ptr + hfl_base + hi, mask=m & is_hier, other=0).to(tl.int32)
+        k = tl.zeros([BLOCK], dtype=tl.int32)
+        for s in range(8):
+            k += (pres >> s) & 1
+        word = tl.where(is_flat, fword, 0)
+        tl.store(word_out + offs, word, mask=m)
+        tl.store(k_out + offs, tl.where(is_hier, k, 0).to(tl.int32), mask=m)
+        tl.store(presb_out + offs, tl.where(is_hier, pres, 0), mask=m)
+        tl.store(hidx_out + offs, tl.where(is_hier, hi, 0), mask=m)
+
+    @triton.jit
+    def _xs_k1c_hier(plane_ptr, pstart_ptr, arena_ptr, meta_ptr,
+                     occ_ptr, mode_ptr, presb_ptr, kval_ptr, niboff_ptr,
+                     word_out, B, BLOCK: tl.constexpr):
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        m = offs < B
+        p = tl.load(plane_ptr + offs, mask=m, other=0)
+        occ = tl.load(occ_ptr + offs, mask=m, other=0)
+        mode = tl.load(mode_ptr + offs, mask=m, other=0)
+        active = m & (occ != 0) & (mode != 0)
+        pres = tl.load(presb_ptr + offs, mask=active, other=0).to(tl.int32)
+        ps = tl.load(pstart_ptr + p, mask=active, other=0)
+        no = tl.load(niboff_ptr + offs, mask=active, other=0).to(tl.int32)
+        kk = tl.load(kval_ptr + offs, mask=active, other=0).to(tl.int32)
+        # offset = inclusive_cum[i] - k[i] - inclusive_cum[s-1]
+        nbase = tl.where(ps > 0, tl.load(niboff_ptr + ps - 1, mask=active, other=0).to(tl.int32), 0)
+        hnib_base = tl.load(meta_ptr + p * 8 + 7, mask=active, other=0)
+        base_off = no - kk - nbase
+        word = tl.zeros([BLOCK], dtype=tl.int32)
+        for s in range(8):
+            has = (pres >> s) & 1
+            # intra-block rank of slot s among present slots
+            low = pres & ((1 << s) - 1)
+            intra = tl.zeros([BLOCK], dtype=tl.int32)
+            for t in range(8):
+                intra += (low >> t) & 1
+            pos = base_off + intra
+            hbyte = tl.load(arena_ptr + hnib_base + (pos >> 1),
+                            mask=active & (has != 0), other=0).to(tl.int32)
+            nib = (hbyte >> ((pos & 1) * 4)) & 0xF
+            word |= tl.where(has != 0, nib << (4 * s), 0)
+        tl.store(word_out + offs, word, mask=active)
+
+    @triton.jit
+    def _xs_k2_gather(plane_ptr, blk_ptr, pstart_ptr, arena_ptr, varena_ptr, meta_ptr,
+                      occ_ptr, word_ptr, pop_ptr, voff_ptr, codebook_ptr, out_ptr, B,
+                      ADAPTIVE: tl.constexpr, BLOCK: tl.constexpr):
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        m = offs < B
+        p = tl.load(plane_ptr + offs, mask=m, other=0)
+        b = tl.load(blk_ptr + offs, mask=m, other=0)
+        occ = tl.load(occ_ptr + offs, mask=m, other=0)
+        word = tl.load(word_ptr + offs, mask=m, other=0).to(tl.int32)
+        vo = tl.load(voff_ptr + offs, mask=m, other=0).to(tl.int32)
+        pp = tl.load(pop_ptr + offs, mask=m, other=0).to(tl.int32)
+        ps = tl.load(pstart_ptr + p, mask=m, other=0)
+        vbase = tl.where(ps > 0, tl.load(voff_ptr + ps - 1, mask=m, other=0).to(tl.int32), 0)
+        vals_base = tl.load(meta_ptr + p * 8 + 4, mask=m, other=0)
+        param = tl.load(meta_ptr + p * 8 + 6, mask=m, other=0)
+        if ADAPTIVE:
+            idx_base = tl.load(meta_ptr + p * 8 + 5, mask=m, other=0)
+            ibyte = tl.load(arena_ptr + idx_base + (b >> 1), mask=m, other=0).to(tl.int32)
+            idx = tl.where((b & 1) != 0, (ibyte >> 4) & 0xF, ibyte & 0xF)
+            cb = tl.load(codebook_ptr + idx, mask=m, other=1.0).to(tl.float32)
+            step_f = param.to(tl.float32) * cb
+        vstart = vals_base + vo - pp - vbase
+        cnt = tl.zeros([BLOCK], dtype=tl.int32)
+        obase = offs * 32
+        for j in range(32):
+            bit = (word >> j) & 1
+            vv = tl.load(varena_ptr + vstart + cnt, mask=m & (occ != 0) & (bit != 0), other=0).to(tl.int32)
+            if ADAPTIVE:
+                f = (vv.to(tl.float32) * step_f).to(tl.int32)
+            else:
+                half = param >> 1
+                sgn = tl.where(vv > 0, 1, tl.where(vv < 0, -1, 0))
+                f = vv * param + sgn * half
+            tl.store(out_ptr + obase + j, tl.where((occ != 0) & (bit != 0), f, 0), mask=m)
+            cnt += bit
+
+    _xs_decode_cache: dict = {}
+
+    def _xs_decode_plan(sparse: dict):
+        """CPU-side plan: inventory + cached GPU index tables + per-image arena.
+
+        Returns (cache_entry, arena_u8_cpu, arena_i8_cpu, meta_cpu, ll4_cpu).
+        No syncs: all lengths are CPU-known tensor metadata.
+        """
+        adaptive = bool(sparse.get("adaptive", False))
+        # Fixed plane order: channel-major (matches dense schema stacking below)
+        inv = []  # (name, ch, h, w, M); static names normalized to adaptive style ('LH4')
+        for c, ch in enumerate(sparse["channels"]):
+            if adaptive:
+                names = [n for n in ("LH4", "HL4", "HH4", "LH3", "HL3", "HH3",
+                                     "LH2", "HL2", "HH2", "LH1", "HL1", "HH1") if n in ch]
+                for n in names:
+                    p = ch[n]
+                    h, w = tuple(p["shape"])
+                    inv.append((n, c, h, w, int(p["M"])))
+            else:
+                for lvl in ("L4", "L3", "L2", "L1"):
+                    if lvl not in ch:
+                        continue
+                    for pn in ("LH", "HL", "HH"):
+                        p = ch[lvl]["planes"][pn]
+                        h, w = tuple(p["shape"])
+                        inv.append((pn + lvl[1:], c, h, w, int(p["M"])))
+        key = (adaptive, tuple(sparse["orig_shape"]), tuple(inv))
+        ent = _xs_decode_cache.get(key)
+        P = len(inv)
+        pstart = [0]
+        for e in inv:
+            pstart.append(pstart[-1] + e[4])
+        B = pstart[-1]
+        # Per-image arena (u8 streams, i8 vals) + meta rows.
+        # meta cols: 0 occ, 1 mode, 2 fmask, 3 hflags, 4 vals, 5 idx, 6 param, 7 hnib
+        meta = torch.zeros((P, 8), dtype=torch.int32)
+        au8, ai8 = [], []
+        ll4_parts = [ch["LL4"].to(torch.int16).reshape(-1) for ch in sparse["channels"]]
+        ou = oi = 0
+        for i, (name, c, h, w, M) in enumerate(inv):
+            ch = sparse["channels"][c]
+            if adaptive:
+                op, ip, param = ch[name], ch[name]["idx_packed"], int(ch[name]["bq"])
+            else:
+                lvl, pn = "L" + name[2:], name[:2]
+                e = ch[lvl]
+                op, ip = e["planes"][pn], None
+                param = int(e["q"]) * (2 if pn == "HH" else 1)
+            occ = op["occ"].reshape(-1)
+            mode = op["mode"].reshape(-1)
+            fmask = op["mask"].reshape(-1)
+            hfl = op["hflags"].reshape(-1)
+            hnib = op["hnib"].reshape(-1)
+            idx = ip.reshape(-1) if ip is not None else torch.zeros(0, dtype=torch.uint8)
+            vals = op["vals"].reshape(-1)
+            meta[i, 0] = ou
+            meta[i, 1] = ou + occ.numel()
+            meta[i, 2] = ou + occ.numel() + mode.numel()
+            meta[i, 3] = ou + occ.numel() + mode.numel() + fmask.numel()
+            meta[i, 7] = ou + occ.numel() + mode.numel() + fmask.numel() + hfl.numel()
+            meta[i, 4] = oi
+            meta[i, 5] = -1  # idx base placeholder (fixed below)
+            meta[i, 6] = param
+            au8 += [occ, mode, fmask, hfl, hnib, idx]
+            ai8 += [vals]
+            ou = ou + occ.numel() + mode.numel() + fmask.numel() + hfl.numel() + hnib.numel() + idx.numel()
+            oi += vals.numel()
+            meta[i, 5] = ou - idx.numel()  # idx base
+        arena_u8 = torch.cat(au8, dim=0) if au8 else torch.zeros(0, dtype=torch.uint8)
+        arena_i8 = torch.cat(ai8, dim=0).to(torch.int8) if ai8 else torch.zeros(0, dtype=torch.int8)
+        ll4 = torch.cat(ll4_parts, dim=0) if ll4_parts else torch.zeros(0, dtype=torch.int16)
+        if ent is None:
+            plane = torch.zeros(B, dtype=torch.int32)
+            blk = torch.zeros(B, dtype=torch.int32)
+            for i, (name, c, h, w, M) in enumerate(inv):
+                s = pstart[i]
+                plane[s:s + M] = i
+                blk[s:s + M] = torch.arange(M, dtype=torch.int32)
+            ent = {"plane": plane, "blk": blk,
+                   "pstart": torch.tensor(pstart, dtype=torch.int32),
+                   "inv": inv, "B": B, "P": P}
+            _xs_decode_cache[key] = ent
+        return ent, arena_u8, arena_i8, meta, ll4
+
+    def _synthesize_wavelet_planes_gpu(LL4, rec_planes, sub, H, W, out_buffer=None):
+        # Shared synthesis: 4-stage IDWT chain(s) + fused RCT store.
+        # LL4 [3,H4,W4] int32; rec_planes name -> [k,H,W] int32 (k=3 shared, k=1 luma L1).
+        from .codec import _upsample2
+        dev = LL4.device
         # 4:4:4 -> full chain; 4:2:0 -> luma 4-stage + chroma 3-stage + upsample
-        from .codec import _upsample2, _chroma_is_subsampled
-        if not _chroma_is_subsampled(packed_meta):
+        if not sub:
             rec_ll3 = torch.empty((3, LL4.shape[1]*2, LL4.shape[2]*2), dtype=torch.int32, device=dev)
             for b in range(3):
                 rec_ll3[b] = _launch_idwt_2d(LL4[b], rec_planes['LH4'][b], rec_planes['HL4'][b], rec_planes['HH4'][b])
@@ -698,7 +913,7 @@ if HAS_TRITON:
             rec_y = torch.empty((1, rec_ll1_y.shape[1]*2, rec_ll1_y.shape[2]*2), dtype=torch.int32, device=dev)
             rec_y[0] = _launch_idwt_2d(rec_ll1_y[0], rec_planes['LH1'][0], rec_planes['HL1'][0], rec_planes['HH1'][0])
             rec_yuv_planes = torch.cat([rec_y, _upsample2(rec_c_half)], dim=0)
-        # RCT
+        # RCT inverse fused store
         Hp, Wp = rec_yuv_planes.shape[1], rec_yuv_planes.shape[2]
         n_pix = Hp * Wp
         y = rec_yuv_planes[0].reshape(-1)
@@ -708,12 +923,119 @@ if HAS_TRITON:
         BLOCK = 1024
         grid = (triton.cdiv(n_pix, BLOCK),)
         _triton_rct_inverse_kernel[grid](y, cb, cr, out_flat, n_pix, BLOCK=BLOCK)
-        rec_yuv = out_flat.view(Hp,Wp,3)
-        rec_rgb = rec_yuv[:H,:W,:]
+        rec_rgb = out_flat.view(Hp, Wp, 3)[:H, :W, :]
         if out_buffer is not None:
             out_buffer.copy_(rec_rgb)
             return out_buffer
         return rec_rgb
+
+    def dequantize_sparse_wavelet_gpu(
+        sparse: dict,
+        device: str | torch.device = "cuda:0",
+        out_buffer: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Full GPU decode straight from the sparse bitstream dict (no CPU round-trip).
+
+        Builds one u8 arena + i8 vals arena + meta table on CPU (no syncs),
+        H2Ds them in 4 transfers, then runs whole-image mega-kernels
+        (K0/K1a/K1b/K1c/K2, one program per 32-elem block across ALL planes)
+        with concatenated torch cumsums for ranks. Handles adaptive and
+        static schemas. Bit-exact vs the CPU sparse reference path.
+        """
+        from .codec import ADAPTIVE_CODEBOOK
+        dev = torch.device(device)
+        H, W, _ = tuple(sparse["orig_shape"])
+        adaptive = bool(sparse.get("adaptive", False))
+        sub = ("LH1" not in sparse["channels"][1]) if adaptive \
+            else ("L1" not in sparse["channels"][1])
+        ent, arena_u8, arena_i8, meta, ll4 = _xs_decode_plan(sparse)
+        B, P = ent["B"], ent["P"]
+        inv = ent["inv"]
+        dplane = ent["plane"].to(dev, non_blocking=True)
+        dblk = ent["blk"].to(dev, non_blocking=True)
+        dpstart = ent["pstart"].to(dev, non_blocking=True)
+        darena = arena_u8.to(dev, non_blocking=True)
+        dvals = arena_i8.to(dev, non_blocking=True)
+        dmeta = meta.to(dev, non_blocking=True)
+        dll4 = ll4.to(dev, non_blocking=True).to(torch.int32)
+        h4, w4 = tuple(sparse["channels"][0]["LL4"].shape)
+        LL4 = dll4.view(3, h4, w4)
+        codebook = sparse.get("codebook", ADAPTIVE_CODEBOOK).to(dev).float() \
+            if adaptive else torch.zeros(16, dtype=torch.float32, device=dev)
+        BLOCK = 256
+        grid = (triton.cdiv(B, BLOCK),)
+        occ = torch.empty(B, dtype=torch.uint8, device=dev)
+        _xs_k0_occ[grid](dplane, dblk, darena, dmeta, occ, B, BLOCK=BLOCK)
+        orank = occ.to(torch.int32).cumsum(0) - 1
+        mode = torch.empty(B, dtype=torch.uint8, device=dev)
+        fsel = torch.empty(B, dtype=torch.uint8, device=dev)
+        hsel = torch.empty(B, dtype=torch.uint8, device=dev)
+        _xs_k1a_mode[grid](dplane, dblk, dpstart, darena, dmeta, occ, orank,
+                           mode, fsel, hsel, B, BLOCK=BLOCK)
+        frank = fsel.to(torch.int32).cumsum(0) - 1
+        hrank = hsel.to(torch.int32).cumsum(0) - 1
+        word = torch.zeros(B, dtype=torch.int32, device=dev)
+        kval = torch.zeros(B, dtype=torch.int32, device=dev)
+        presb = torch.zeros(B, dtype=torch.int32, device=dev)
+        hidx = torch.zeros(B, dtype=torch.int32, device=dev)
+        _xs_k1b_words[grid](dplane, dblk, dpstart, darena, dmeta, occ, mode,
+                            orank, frank, hrank, word, kval, presb, hidx, B,
+                            BLOCK=BLOCK)
+        ar32 = torch.arange(32, device=dev)
+        niboff = kval.cumsum(0)
+        _xs_k1c_hier[grid](dplane, dpstart, darena, dmeta, occ, mode, presb,
+                           kval, niboff, word, B, BLOCK=BLOCK)
+        # pop/voff AFTER K1c: hier words are only valid now
+        pop = (((word.unsqueeze(-1) >> ar32) & 1).sum(-1).to(torch.int32))
+        voff = pop.cumsum(0)
+        out = torch.empty(B * 32, dtype=torch.int32, device=dev)
+        _xs_k2_gather[grid](dplane, dblk, dpstart, darena, dvals, dmeta, occ,
+                            word, pop, voff, codebook, out, B, ADAPTIVE=adaptive,
+                            BLOCK=BLOCK)
+        # Views per plane (no copies) -> stacked level tensors for synthesis
+        pstart_cpu = ent["pstart"].tolist()
+        rec_planes = {}
+        per_name: dict = {}
+        for i, (name, c, h, w, M) in enumerate(inv):
+            s = pstart_cpu[i] * 32
+            v = out[s:s + h * w].view(h, w)
+            per_name.setdefault(name, []).append(v)
+        for name, lst in per_name.items():
+            rec_planes[name] = torch.stack(lst, dim=0)
+        return _synthesize_wavelet_planes_gpu(LL4, rec_planes, sub, H, W, out_buffer)
+
+    def dequantize_fused_wavelet_adaptive_gpu(
+        packed_meta: dict,
+        device: str | torch.device = "cuda:0",
+        out_buffer: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        dev = torch.device(device)
+        H, W, C = packed_meta['orig_shape']
+        G = packed_meta.get('G', 32)
+        from .codec import ADAPTIVE_CODEBOOK, _chroma_is_subsampled
+        codebook = packed_meta.get('codebook', ADAPTIVE_CODEBOOK).to(dev).float()
+        channels = packed_meta['channels']
+        # Build rec planes via Triton adaptive dequant
+        # L4/L3/L2 stack [3, ...] (Y + subsampled C); L1 is luma-only [1, ...]
+        LL4 = torch.stack([ch['LL4'].to(dev).to(torch.int32) for ch in channels], dim=0)
+        # For each plane, Triton dequant
+        plane_names = ["LH4","HL4","HH4","LH3","HL3","HH3","LH2","HL2","HH2","LH1","HL1","HH1"]
+        rec_planes = {}
+        rec_planes['LL4'] = LL4
+        for name in plane_names:
+            rec_list = []
+            for c in range(3):
+                ch = channels[c]
+                if name not in ch:
+                    continue  # chroma has no L1 under 4:2:0
+                q_plane, idx_packed, bq = ch[name]
+                q_plane = q_plane.to(dev)
+                idx_packed = idx_packed.to(dev)
+                rec = _launch_wavelet_adaptive_dequant(q_plane, idx_packed, bq, codebook, G)
+                rec_list.append(rec)
+            rec_planes[name] = torch.stack(rec_list, dim=0)
+        return _synthesize_wavelet_planes_gpu(
+            LL4, rec_planes, _chroma_is_subsampled(packed_meta), H, W, out_buffer)
 
 
 
@@ -915,6 +1237,20 @@ else:
         # To avoid recursion, call codec directly with HAS_TRITON disabled? Use codec's PyTorch path
         # We expose the Triton version via _dequant_adaptive_triton wrapper, but for now delegate to codec
         return dequantize_pixel_wavelet_adaptive(*args, **kwargs)
+
+    def dequantize_sparse_wavelet_gpu(sparse, device="cpu", out_buffer=None):
+        # No Triton: unpack on target device with sync-free torch, then CPU/GPU
+        # reference synthesis via dense rebuild.
+        from .codec import sparse_unpack_meta_gpu, dequantize_pixel_wavelet_adaptive
+        import torch as _torch
+        dev = _torch.device(device)
+        if dev.type in ("cuda", "hip"):
+            raise RuntimeError("dequantize_sparse_wavelet_gpu requires Triton + CUDA/ROCm")
+        dense = sparse_unpack_meta_gpu(sparse, dev)
+        if sparse.get("adaptive", False):
+            return dequantize_pixel_wavelet_adaptive(dense, device=device, out_buffer=out_buffer)
+        from .codec import dequantize_pixel_wavelet8x
+        return dequantize_pixel_wavelet8x(dense, device=device, out_buffer=out_buffer)
 
     _fused_quant_kernel = None
     _fused_amo_quant_kernel = None

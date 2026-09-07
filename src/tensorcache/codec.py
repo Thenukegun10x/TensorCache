@@ -1881,6 +1881,136 @@ def sparse_unpack_meta(sparse: dict) -> dict:
     return out
 
 
+def _popcount_u8(x: torch.Tensor) -> torch.Tensor:
+    """Vectorized popcount for uint8/int32 tensor -> int32 counts. GPU-safe, no sync."""
+    ar8 = torch.arange(8, device=x.device)
+    return (((x.to(torch.int32).unsqueeze(-1) >> ar8) & 1).sum(-1).to(torch.int32))
+
+
+def sparse_unpack_plane_gpu(
+    packed: dict,
+    G: int = 32,
+) -> torch.Tensor:
+    """Sync-free GPU port of sparse_unpack_plane -> int8 plane [h, w].
+
+    Identical output to sparse_unpack_plane, but every data-dependent count
+    is replaced by clamped cumsum ranks + where-masks, so no .item() sync
+    ever fires. All blob tensors must already live on the target device
+    (caller moves them H2D); compute never leaves it.
+    """
+    if G != 32:
+        raise ValueError(f"sparse bitstream requires G=32, got {G}")
+    dev = packed["occ"].device
+    mask, vals, occ = packed["mask"], packed["vals"], packed["occ"]
+    hflags, hnib, mode_b = packed["hflags"], packed["hnib"], packed["mode"]
+    h, w = tuple(packed["shape"])
+    M = int(packed["M"])
+    N = h * w
+    ar8 = torch.arange(8, device=dev)
+    ar32 = torch.arange(32, device=dev)
+    occ_bits = (((occ.to(torch.int16).unsqueeze(-1) >> ar8) & 1)
+                .reshape(-1)[:M].bool())
+    # mode bits over the full block grid via occupancy rank (no Mo sync)
+    m_all = (((mode_b.to(torch.int16).unsqueeze(-1) >> ar8) & 1)
+             .reshape(-1).bool()) if mode_b.numel() else occ_bits[:0]
+    if m_all.numel() < M:
+        m_all = torch.cat([m_all, torch.zeros(M - m_all.numel(),
+                                              dtype=torch.bool, device=dev)])
+    else:
+        m_all = m_all[:M]
+    rank = (occ_bits.cumsum(0) - 1).clamp(min=0)
+    mode_full = torch.where(occ_bits, m_all[rank], torch.zeros((), dtype=torch.bool, device=dev))
+    flat_sel = occ_bits & ~mode_full
+    hier_sel = occ_bits & mode_full
+    # per-block 32-bit occupancy words; flat and hier selections are disjoint
+    mask32 = torch.zeros(M, dtype=torch.int32, device=dev)
+    if mask.numel():
+        fm = mask.to(torch.int32)  # [Mf, 4], Mf == flat_sel.count by construction
+        mask32[flat_sel] = (fm[:, 0] | (fm[:, 1] << 8)
+                            | (fm[:, 2] << 16) | (fm[:, 3] << 24))
+    hf = hflags if hflags.numel() else torch.zeros(1, dtype=torch.uint8, device=dev)
+    hrank = (hier_sel.cumsum(0) - 1).clamp(min=0, max=hf.numel() - 1)
+    hfb = hf[hrank].to(torch.int32)  # presence byte per block (masked unless hier)
+    k_all = torch.where(hier_sel, _popcount_u8(hfb), torch.zeros((), dtype=torch.int32, device=dev))
+    off_all = (k_all.cumsum(0) - k_all).to(torch.long)
+    if hnib.numel():
+        pairs_all = torch.stack([hnib & 0xF, (hnib >> 4) & 0xF], dim=1).view(-1)
+    else:
+        pairs_all = torch.zeros(1, dtype=torch.uint8, device=dev)
+    plast = pairs_all.numel() - 1
+    for s in range(8):
+        bit = hier_sel & ((hfb >> s) & 1).bool()
+        intra = _popcount_u8(hfb & ((1 << s) - 1))
+        pos = (off_all + intra.to(torch.long)).clamp(max=plast)
+        nib = pairs_all[pos].to(torch.int32)
+        mask32 |= torch.where(bit, (nib & 0xF) << (4 * s),
+                              torch.zeros((), dtype=torch.int32, device=dev))
+    nz_full = (((mask32.unsqueeze(-1) >> ar32) & 1).bool()).reshape(-1)
+    out = torch.zeros(M * G, dtype=torch.int8, device=dev)
+    out[nz_full] = vals.to(torch.int8)
+    return out[:N].view(h, w)
+
+
+def sparse_unpack_meta_gpu(sparse: dict, device: str | torch.device) -> dict:
+    """Move sparse blobs H2D and unpack every plane on-device (no syncs).
+
+    Returns the dense packed_meta schema on `device`, ready for any GPU
+    dequantizer. Pure function of the sparse dict (caller keeps ownership).
+    """
+    dev = torch.device(device)
+    mv = lambda t: t.to(dev, non_blocking=True)
+    G = sparse.get("G", 32)
+    channels = []
+    if sparse["adaptive"]:
+        for ch in sparse["channels"]:
+            d = {"LL4": mv(ch["LL4"])}
+            for name, p in ch.items():
+                if name == "LL4":
+                    continue
+                q = sparse_unpack_plane_gpu(
+                    {"mask": mv(p["mask"]), "hflags": mv(p["hflags"]),
+                     "hnib": mv(p["hnib"]), "mode": mv(p["mode"]),
+                     "occ": mv(p["occ"]), "vals": mv(p["vals"]),
+                     "shape": tuple(p["shape"]), "M": int(p["M"])}, G)
+                d[name] = (q, mv(p["idx_packed"]), int(p["bq"]))
+            channels.append(d)
+    else:
+        for ch in sparse["channels"]:
+            d = {"LL4": mv(ch["LL4"])}
+            for lvl in ("L4", "L3", "L2", "L1"):
+                if lvl not in ch:
+                    continue  # chroma has no L1 under 4:2:0
+                e = ch[lvl]
+                planes = tuple(
+                    sparse_unpack_plane_gpu(
+                        {"mask": mv(e["planes"][pn]["mask"]),
+                         "hflags": mv(e["planes"][pn]["hflags"]),
+                         "hnib": mv(e["planes"][pn]["hnib"]),
+                         "mode": mv(e["planes"][pn]["mode"]),
+                         "occ": mv(e["planes"][pn]["occ"]),
+                         "vals": mv(e["planes"][pn]["vals"]),
+                         "shape": tuple(e["planes"][pn]["shape"]),
+                         "M": int(e["planes"][pn]["M"])}, G)
+                    for pn in ("LH", "HL", "HH")
+                )
+                d[lvl] = planes + (int(e["q"]),)
+            channels.append(d)
+    out = {
+        "adaptive": sparse["adaptive"],
+        "orig_shape": tuple(sparse["orig_shape"]),
+        "pad_h": int(sparse["pad_h"]),
+        "pad_w": int(sparse["pad_w"]),
+        "channels": channels,
+    }
+    if sparse["adaptive"]:
+        out["G"] = G
+        out["codebook"] = sparse["codebook"].to(dev, non_blocking=True)
+        out["q_scale"] = sparse.get("q_scale")
+        out["lamb"] = sparse.get("lamb")
+        out["mode"] = sparse.get("mode")
+    return out
+
+
 def _plane_nbytes(p: dict) -> int:
     return (p["mask"].nelement() + p["hflags"].nelement() + p["hnib"].nelement()
             + p["mode"].nelement() + p["vals"].nelement() + p["occ"].nelement())

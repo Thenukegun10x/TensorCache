@@ -27,8 +27,10 @@ from .codec import (
     dequantize_pixel_wavelet_adaptive,
     sparse_pack_plane,
     sparse_unpack_plane,
+    sparse_unpack_plane_gpu,
     sparse_pack_meta,
     sparse_unpack_meta,
+    sparse_unpack_meta_gpu,
     sparse_nbytes,
     ADAPTIVE_CODEBOOK,
     SUBBAND_GAINS,
@@ -53,6 +55,7 @@ from .fused_ops import (
     dequantize_fused_wavelet8x_gpu,
     quantize_fused_wavelet_adaptive_gpu,
     dequantize_fused_wavelet_adaptive_gpu,
+    dequantize_sparse_wavelet_gpu,
     FusedDequantLinear
 )
 from .prefetcher import AsyncGPUPrefetcher
@@ -91,8 +94,10 @@ __all__ = [
     "dequantize_pixel_wavelet_adaptive",
     "sparse_pack_plane",
     "sparse_unpack_plane",
+    "sparse_unpack_plane_gpu",
     "sparse_pack_meta",
     "sparse_unpack_meta",
+    "sparse_unpack_meta_gpu",
     "sparse_nbytes",
     "ADAPTIVE_CODEBOOK",
     "SUBBAND_GAINS",
@@ -113,6 +118,7 @@ __all__ = [
     "dequantize_fused_wavelet8x_gpu",
     "quantize_fused_wavelet_adaptive_gpu",
     "dequantize_fused_wavelet_adaptive_gpu",
+    "dequantize_sparse_wavelet_gpu",
     "FusedDequantLinear",
     "AsyncGPUPrefetcher",
     "FeatureCacheWriter",
