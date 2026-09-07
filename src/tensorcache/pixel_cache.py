@@ -753,13 +753,13 @@ def make_xs_loader(
         # Worker-side batch fan-in (one packed tensor per batch over IPC);
         # main-side collate splits it back into arena views (zero copies).
         # __getitems__ is DataLoader's hook for worker-side batching.
-        get_ds = _PackedArenaDataset(ds)
-        gen = torch.Generator().manual_seed(seed) if seed is not None else None
-        loader = DataLoader(
-            get_ds,
-            batch_size=batch_size, shuffle=shuffle, drop_last=drop_last,
-            num_workers=num_workers,
-            collate_fn=lambda bd: _split_batch_packed(bd, ds),
+            get_ds = _PackedArenaDataset(ds)
+            gen = torch.Generator().manual_seed(seed) if seed is not None else None
+            loader = DataLoader(
+                get_ds,
+                batch_size=batch_size, shuffle=shuffle, drop_last=drop_last,
+                num_workers=num_workers,
+                collate_fn=_SplitBatchCollate(ds),
             prefetch_factor=prefetch_factor,
             persistent_workers=True if persistent_workers is None else persistent_workers,
             generator=gen,
@@ -768,7 +768,7 @@ def make_xs_loader(
         if persistent_workers is None:
             persistent_workers = False
         loader = DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
-                            num_workers=0, collate_fn=lambda b: b,
+                            num_workers=0, collate_fn=_identity_collate,
                             drop_last=drop_last)
     try:
         if dev.type in ("cuda", "hip"):
@@ -791,6 +791,20 @@ def _packed_len(u8_len: int, i8_len: int, n_planes: int, ll4_len: int) -> int:
     o2 = u8_len + i8_len + (-(u8_len + i8_len)) % 4
     end = o2 + n_planes * 8 * 4 + ll4_len * 2
     return end + (-end) % 4
+
+
+def _identity_collate(b):
+    return b
+
+
+class _SplitBatchCollate:
+    """Picklable collate: splits a worker-fanned batch blob into arena dicts."""
+
+    def __init__(self, ds: "PixelCacheDataset"):
+        self.ds = ds
+
+    def __call__(self, bd: dict) -> list:
+        return _split_batch_packed(bd, self.ds)
 
 
 def _split_batch_packed(bd: dict, ds: PixelCacheDataset) -> list:
