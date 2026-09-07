@@ -1376,14 +1376,21 @@ else:
 
     def dequantize_sparse_wavelet_gpu(sparse, device="cpu", out_buffer=None):
         # No Triton: unpack on target device with sync-free torch, then CPU/GPU
-        # reference synthesis via dense rebuild. Arenas convert via sparse dict.
-        from .codec import sparse_unpack_meta_gpu, dequantize_pixel_wavelet_adaptive, sparse_pack_arena
+        # reference synthesis via dense rebuild. Stored arenas convert first.
+        from .codec import (sparse_unpack_meta_gpu, dequantize_pixel_wavelet_adaptive,
+                            arena_to_sparse, sparse_unpack_meta)
         import torch as _torch
         dev = _torch.device(device)
         if dev.type in ("cuda", "hip"):
             raise RuntimeError("dequantize_sparse_wavelet_gpu requires Triton + CUDA/ROCm")
         if sparse.get("format") == "xs-arena-v1":
-            raise RuntimeError("CPU fallback needs legacy sparse dicts; convert at encode time")
+            legacy = arena_to_sparse(sparse)
+            if legacy.get("adaptive", False):
+                return dequantize_pixel_wavelet_adaptive(
+                    sparse_unpack_meta(legacy), device=device, out_buffer=out_buffer)
+            from .codec import dequantize_pixel_wavelet8x
+            return dequantize_pixel_wavelet8x(
+                sparse_unpack_meta(legacy), device=device, out_buffer=out_buffer)
         dense = sparse_unpack_meta_gpu(sparse, dev)
         if sparse.get("adaptive", False):
             return dequantize_pixel_wavelet_adaptive(dense, device=device, out_buffer=out_buffer)
@@ -1392,12 +1399,23 @@ else:
 
     def dequantize_sparse_wavelet_batch_gpu(arenas, device="cpu"):
         import torch as _torch
+        from .codec import arena_to_sparse, sparse_unpack_meta, dequantize_pixel_wavelet_adaptive
         dev = _torch.device(device)
         if dev.type in ("cuda", "hip"):
             raise RuntimeError("dequantize_sparse_wavelet_batch_gpu requires Triton + CUDA/ROCm")
         outs = []
         for a in arenas:
-            outs.append(dequantize_sparse_wavelet_gpu(a, device=device))
+            if a.get("format") == "xs-arena-v1":
+                legacy = arena_to_sparse(a)
+                if legacy.get("adaptive", False):
+                    outs.append(dequantize_pixel_wavelet_adaptive(
+                        sparse_unpack_meta(legacy), device=device))
+                    continue
+                from .codec import dequantize_pixel_wavelet8x
+                outs.append(dequantize_pixel_wavelet8x(
+                    sparse_unpack_meta(legacy), device=device))
+            else:
+                outs.append(dequantize_sparse_wavelet_gpu(a, device=device))
         return _torch.stack(outs, dim=0)
 
     _fused_quant_kernel = None

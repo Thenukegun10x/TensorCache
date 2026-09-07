@@ -2097,6 +2097,94 @@ def sparse_pack_arena(sparse: dict) -> dict:
     return out
 
 
+def arena_to_sparse(arena: dict) -> dict:
+    """Invert sparse_pack_arena: rebuild the legacy sparse dict (plane views).
+
+    CPU-only compat path (Windows / no-Triton): lets every existing CPU
+    unpacker/dequantizer consume stored arenas. All slices are views (no
+    copies); occ-bit popcounts use pure-Python bin counts (no syncs).
+    """
+    assert arena.get("format") == "xs-arena-v1", "not an xs arena dict"
+    adaptive = bool(arena.get("adaptive", False))
+    au8, ai8, meta = arena["arena_u8"], arena["arena_i8"], arena["meta"]
+    inv = arena["inv"]
+    P = len(inv)
+    u8_end = au8.numel()
+    i8_end = ai8.numel()
+
+    def occ_count(o0: int, o1: int) -> int:
+        # popcount of occupancy bytes [o0:o1) in pure Python (mmap/CPU safe)
+        return sum(bin(int(v)).count("1") for v in au8[o0:o1].tolist())
+
+    planes = []  # per inv entry: rebuilt plane dict
+    for i, (name, c, h, w, M) in enumerate(inv):
+        o0, o1, o2, o3 = (int(meta[i, k].item()) for k in (0, 1, 2, 3))
+        oi, ox, o7 = int(meta[i, 4].item()), int(meta[i, 5].item()), int(meta[i, 7].item())
+        plane_u8_end = int(meta[i + 1, 0].item()) if i + 1 < P else u8_end
+        vals_end = int(meta[i + 1, 4].item()) if i + 1 < P else i8_end
+        occ = au8[o0:o1]
+        Mo = occ_count(o0, o1)
+        hfl = au8[o3:o7]
+        Mh = hfl.numel()
+        Mf = Mo - Mh
+        fmask = au8[o2:o3].view(Mf, 4)
+        planes.append({
+            "occ": occ,
+            "mode": au8[o1:o2],
+            "mask": fmask,
+            "hflags": hfl,
+            "hnib": au8[o7:ox],
+            "vals": ai8[oi:vals_end].to(torch.int8),
+            "shape": (h, w),
+            "M": M,
+            "idx_len": plane_u8_end - ox,
+        })
+        planes[-1]["_idx"] = au8[ox:plane_u8_end]
+        planes[-1]["_param"] = int(meta[i, 6].item())
+
+    # LL4 per channel (concat order matches sparse_pack_arena)
+    ll4_shapes = [tuple(s) for s in arena["ll4_shapes"]]
+    ll4_flat = arena["ll4"].to(torch.int16)
+    ll4s, pos = [], 0
+    for s in ll4_shapes:
+        n = s[0] * s[1]
+        ll4s.append(ll4_flat[pos:pos + n].view(s))
+        pos += n
+
+    channels = [{"LL4": ll4s[c]} for c in range(3)]
+    for i, (name, c, h, w, M) in enumerate(inv):
+        pl = planes[i]
+        # Sparse-schema plane dict (mirrors sparse_pack_meta output), so the
+        # existing sparse_unpack_meta consumes it unchanged.
+        pd = {"mask": pl["mask"], "hflags": pl["hflags"], "hnib": pl["hnib"],
+              "mode": pl["mode"], "occ": pl["occ"], "vals": pl["vals"],
+              "shape": pl["shape"], "M": pl["M"]}
+        if adaptive:
+            pd["idx_packed"] = pl["_idx"].to(torch.uint8)
+            pd["bq"] = pl["_param"]
+            channels[c][name] = pd
+        else:
+            lvl, pn = "L" + name[2:], name[:2]
+            ch = channels[c]
+            if lvl not in ch:
+                ch[lvl] = {"planes": {}, "q": pl["_param"]}  # q from LH (x1) plane
+            ch[lvl]["planes"][pn] = pd
+    out = {
+        "adaptive": adaptive,
+        "orig_shape": tuple(arena["orig_shape"]),
+        "pad_h": int(arena["pad_h"]),
+        "pad_w": int(arena["pad_w"]),
+        "channels": channels,
+    }
+    if adaptive:
+        out["G"] = 32
+        out["codebook"] = arena["codebook"]
+        out["q_scale"] = arena.get("q_scale")
+        out["lamb"] = arena.get("lamb")
+        out["mode"] = arena.get("mode")
+    return out
+
+
 def arena_nbytes(arena: dict) -> int:
     """Actual stored bytes of an arena dict (tensors only)."""
     return (arena["arena_u8"].nelement() + arena["arena_i8"].nelement()

@@ -240,6 +240,47 @@ def test_sparse_bitstream_roundtrip():
           f"(static {raw_bytes/sparse_nbytes(sp):.2f}x, adaptive {raw_bytes/sparse_nbytes(asp):.2f}x)")
 
 
+def test_xs_pixel_cache():
+    """XS wavelet PixelCache: write arenas -> single/batch decode bit-exact."""
+    from tensorcache.codec import (quantize_pixel_wavelet_adaptive,
+                                   dequantize_pixel_wavelet_adaptive,
+                                   sparse_pack_meta, sparse_unpack_meta)
+    dev = "cuda:0" if torch.cuda.is_available() else "cpu"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        prefix = str(Path(tmpdir) / "xs_cache")
+        H, W, N = 64, 64, 4
+        imgs = [_natural_test_img(H, W, seed=s) for s in range(N)]
+        writer = PixelCacheWriter(prefix, num_samples=N, height=H, width=W, channels=3,
+                                  quant="xs", xs_mode="balanced")
+        for im in imgs:
+            writer.append_image(im.numpy())
+        writer.close()
+
+        ds = PixelCacheDataset(prefix, decode_device=dev)
+        assert len(ds) == N
+        refs = []
+        for im in imgs:
+            m, _ = quantize_pixel_wavelet_adaptive(im, mode="balanced")
+            refs.append(dequantize_pixel_wavelet_adaptive(
+                sparse_unpack_meta(sparse_pack_meta(m)), device="cpu"))
+        for i in range(N):
+            got = ds[i]
+            assert got.shape == (H, W, 3) and got.dtype == torch.uint8
+            assert torch.equal(refs[i], got.cpu()), f"xs single {i}"
+        batch = ds.decode_arenas([ds.get_arena(i) for i in range(N)], device=dev)
+        assert batch.shape == (N, H, W, 3)
+        for i in range(N):
+            assert torch.equal(refs[i], batch[i].cpu()), f"xs batch {i}"
+        n = sum(b.shape[0] for b in ds.iter_batches(batch_size=2, device=dev))
+        assert n == N
+        # CPU fallback parity (Windows-safe path)
+        ds_cpu = PixelCacheDataset(prefix, decode_device="cpu")
+        assert torch.equal(refs[0], ds_cpu[0])
+        ds_cpu.close()
+        ds.close()
+        print("[+] XS PixelCache round-trip OK (single + batch + CPU fallback)")
+
+
 if __name__ == "__main__":
     test_quantize_dequantize_roundtrip()
     test_adaptive_quantize_roundtrip()
@@ -249,5 +290,6 @@ if __name__ == "__main__":
     test_pixel_cache_quantized_disk_io()
     test_wavelet_8x_codec()
     test_sparse_bitstream_roundtrip()
+    test_xs_pixel_cache()
 
     print("\n[+] ALL UNIT TESTS PASSED SUCCESSFULLY!")
