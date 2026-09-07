@@ -21,6 +21,7 @@
 * **Minimal VRAM:** `q 5.22MB + scales 0.32MB + zp 0.16MB + out 10.45MB` `5.4M`; `G64` halves `scales/zp`.
 * **Cross-Platform:** `CUDA`/`ROCm` `Triton` else `PyTorch` fallback, `Windows` `mmap` safe `close()`.
 * **Tunable JPEG-XS Pixel:** `quantize_pixel_wavelet_adaptive(mode="balanced")` `lamb` `D+lamb*R` `G32 4b` `codebook 16` `TCQ-lite` `subband gains` `4:2:0` `sparse + zero-block skip + hier masks` `37dB 7.8x` (`44dB 3.2x` <-> `33dB 13.6x`, COCO val 336) `vs static 34dB 11.5x`.
+* **XS Image Pipeline (new):** `tc.cache_images(dir, prefix)` one-liner build → `tc.make_xs_loader(prefix, batch_size=256)` yields `uint8 [B,H,W,3]` on `CUDA` at `~10k img/s` sustained `@336` (`laptop 4050`, `file->GPU`, `workers=0`) — `6.7x` on `5000x COCO`, `GPU` mega-kernel batch decode (`K0/K1a/K1b/K1c/K2` + compiled synthesis, bit-exact), `spawn-safe` workers, `CPU` fallback bit-exact.
 * **CLI + Python one-liners:** `tc.compress` / `tc.benchmark_tensor` / `tensorcache benchmark`.
 
 ---
@@ -102,16 +103,36 @@ logits = head(q, s) # dequant+GEMM in regs
 ### 2b. XS Wavelet Image Cache (JPEG-XS style, GPU-decoded)
 ```python
 import tensorcache as tc
-# One-liner build: dir of JPEGs/PNGs -> ~7.1x mmap cache (balanced default)
+# One-liner build: dir of JPEGs/PNGs -> mmap cache (balanced default)
 info = tc.cache_images("data/coco_val", "./cache/coco336")
-# -> {"num_samples": 5000, "ratio_vs_raw": 7.1, "ms_per_img": 50, ...}
+# -> {"num_samples": 5000, "ratio_vs_raw": 6.74, "ms_per_img": 58, ...}
 
-# Training loop: workers slice arenas (CPU), main proc batch-decodes on GPU
+# Training loop: page-cache slices in, GPU batches out (workers optional)
 for imgs in tc.make_xs_loader("./cache/coco336", batch_size=256,
                               device="cuda", num_workers=8):
-    train(imgs)  # uint8 [B,H,W,3] on CUDA, ~12k img/s sustained @336 (laptop 4050)
+    train(imgs)  # uint8 [B,H,W,3] on CUDA
 ```
-Fidelity presets (`xs_mode`): ultra 44.4dB 3.2x, high 39.8dB 5.6x, balanced 36.8dB 7.8x (default), compress 35.3dB 9.8x, ultra_comp 33.0dB 13.6x (16x COCO val, 1x uint8 baseline). CPU fallback is bit-exact (Windows-safe, no Triton needed).
+Fidelity presets (`xs_mode`, measured `16x COCO val 336`, `1x` = raw `RGB`):
+
+| preset | PSNR | SSIM | ratio | enhances |
+|---|:---:|:---:|:---:|---|
+| ultra (`4:4:4`) | `44.4dB` | `0.993` | `3.2x` | transparent — invisible even flipped |
+| high (`4:4:4`) | `39.8dB` | — | `5.6x` | high quality |
+| balanced (`4:2:0`, default) | `36.8dB` | `0.97` | `7.8x` | invisible at normal viewing |
+| compress (`4:2:0`) | `35.3dB` | — | `9.8x` | high compression |
+| ultra_comp (`4:2:0`) | `33.0dB` | `0.92` | `13.6x` | visible softening in busy texture |
+
+Throughput (`balanced`, `336²`, `laptop RTX 4050`, sustained medians):
+
+| path | img/s | notes |
+|---|:---:|---|
+| `make_xs_loader` `BS32` (`workers=0`) | `~10k` | `file->GPU`, `60s` windows, `1965MHz` |
+| batch API `BS32` | `~12k` | `16.5k` peak-boost bursts |
+| batch API `BS256` | `~10.4k` | saturated plateau (`20 SMs` full at `BS32`) |
+| single image | `~1.2k` | `0.8ms`, `out_buffer` zero-alloc |
+| `PIL JPEG` `8 workers` (status quo) | `~0.8-1k` | what training does today |
+
+`ViT-B` burns `~1-1.5k img/s/GPU` — the cache feeds `~10x` headroom on a laptop card while moving `43KB/img` (`~430MB/s H2D`, `PCIe` idle). Bigger GPUs just want bigger batches (`RTX PRO` saturates ~`BS256+`); `GB10` fits whole datasets in `128GB` unified memory. `CPU` fallback is bit-exact (`Windows`-safe, no `Triton` needed).
 
 ### 3. CLI
 ```bash
