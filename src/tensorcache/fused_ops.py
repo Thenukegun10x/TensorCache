@@ -854,13 +854,14 @@ if HAS_TRITON:
         ent = _xs_gpu_tables.get(ck)
         if ent is None:
             B, P = pent["B"], pent["P"]
+            HWsum = int(pent["HWsum"])
             plane_single, blk_single = pent["plane"], pent["blk"]
             obase_single, phw_single = pent["obase"], pent["phw"]
             if N > 1:
                 plane_global = torch.cat([plane_single + n * P for n in range(N)], dim=0)
                 blk_global = torch.cat([blk_single] * N, dim=0)
                 obase_global = torch.cat(
-                    [obase_single + n * pent["HWsum"] for n in range(N)], dim=0)
+                    [obase_single + n * HWsum for n in range(N)], dim=0)
                 phw_global = torch.cat([phw_single] * N, dim=0)
             else:
                 plane_global, blk_global = plane_single, blk_single
@@ -871,12 +872,27 @@ if HAS_TRITON:
                 base = n * B
                 for i in range(P):
                     pstart_list.append(base + int(ps[i + 1]))
+            # Permutation: packed plane-concat -> name-major [N,k,h,w] flat.
+            # Built once per (config, N); the compiled gather is a single
+            # index-select, so compile time no longer grows with N.
+            perm_parts, chunks, pos = [], [], 0
+            nbase = torch.arange(N, dtype=torch.int32).view(N, 1, 1) * HWsum
+            for name, (h0, w0, offs) in pent["gather_spec"].items():
+                k = len(offs)
+                L = h0 * w0
+                idx = (nbase + torch.tensor(offs, dtype=torch.int32).view(1, k, 1)
+                       + torch.arange(L, dtype=torch.int32).view(1, 1, L)).reshape(-1)
+                perm_parts.append(idx)
+                chunks.append((name, N, k, h0, w0, pos, pos + idx.numel()))
+                pos += idx.numel()
             ent = {
                 "dplane": plane_global.to(dev),
                 "dblk": blk_global.to(dev),
                 "dpstart": torch.tensor(pstart_list, dtype=torch.int32).to(dev),
                 "dobase": obase_global.to(dev),
                 "dphw": phw_global.to(dev),
+                "dperm": torch.cat(perm_parts, dim=0).to(dev),
+                "chunks": tuple(chunks),
             }
             _xs_gpu_tables[ck] = ent
         return ent
@@ -982,20 +998,20 @@ if HAS_TRITON:
         from .codec import sparse_pack_arena
         return sparse_pack_arena(sparse)
 
-    def _gather_synth_eager(out, LL4b, spec, sub, H, W, HWsum, N):
+    def _gather_synth_eager(out, LL4b, perm, chunks, sub, H, W):
         """Packed planes -> [N,H,W,3] uint8, one compiled region (torch, bit-exact).
 
-        The per-name stacks live INSIDE: Inductor turns them into index math
-        inside the fused IDWT kernels, so the 43 MB restack copies + 12
-        launches vanish. Same integer lifting as the Triton single path.
+        Single index-select + views feed the IDWT chain: Inductor fuses the
+        gather into its consumers, so no restack copies materialize and the
+        trace has a fixed op count (compile time independent of N).
+        Same integer lifting as the Triton single path.
         Pure tensor ops (no data-dependent Python) so torch.compile fuses it.
         """
         from .codec import _idwt_53_2d_step_batched, _upsample2, rct_inverse
+        flat = out[perm]
         recb: dict = {}
-        for name, (h0, w0, offs) in spec.items():
-            parts = [out[n * HWsum + o:n * HWsum + o + h0 * w0].view(h0, w0)
-                     for n in range(N) for o in offs]
-            recb[name] = torch.stack(parts, dim=0).view(N, len(offs), h0, w0)
+        for (name, N, k, h0, w0, s, e) in chunks:
+            recb[name] = flat[s:e].view(N, k, h0, w0)
 
         def _idwt4(LL, LH, HL, HH):
             # [N,k,h,w] -> [N,k,2h,2w] via flattened 3D IDWT (F.pad needs 3D)
@@ -1120,7 +1136,7 @@ if HAS_TRITON:
                             word, pop, voff, codebook, out, dobase, dphw,
                             BT, ADAPTIVE=adaptive, BLOCK=BLOCK)
         sub = not any((nm == "LH1" and cc == 1) for (nm, cc, hh, ww, MM) in inv)
-        return _gather_synth(out, LL4b, pent["gather_spec"], sub, H, W, HWsum, N)
+        return _gather_synth(out, LL4b, gt["dperm"], gt["chunks"], sub, H, W)
 
     def dequantize_sparse_wavelet_gpu(
         sparse: dict,
