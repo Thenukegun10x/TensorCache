@@ -30,6 +30,8 @@ class PixelCacheWriter:
     or XS wavelet arena cache (quant="xs": ~7.8x at 36.8dB balanced, GPU-decodable).
     Quantized caches use blockwise 4/3-bit (G=32) with BF16 scales, 2x/2.29x vs raw, PSNR 37/31dB.
     Feature caches in INT4/INT3 are blocked (guarded) due to >2% RMSE collapse.
+    Mono support: channels=1 stores grayscale 1-sample/pixel (3x smaller raw/int4/int3
+    than replicating to RGB); requires grayscale inputs, rejects color ones.
     """
     def __init__(
         self,
@@ -42,6 +44,7 @@ class PixelCacheWriter:
         quant_bits: Optional[int] = None,
         group_size: int = 32,
         xs_mode: str = "balanced",
+        chroma420: Optional[bool] = None,
     ):
         # Normalize quant args: quant="raw"/"int4"/"int3"/"xs" or quant_bits=8/4/3
         if quant_bits is not None:
@@ -55,9 +58,14 @@ class PixelCacheWriter:
                 raise ValueError(f"quant_bits must be 8/4/3, got {quant_bits}")
         if quant not in ("raw", "int4", "int3", "xs"):
             raise ValueError(f"quant must be 'raw'/'int4'/'int3'/'xs', got {quant}")
+        if channels not in (1, 3):
+            raise ValueError(f"channels must be 1 (mono) or 3 (RGB), got {channels}")
+        if channels == 1 and quant == "xs":
+            raise ValueError("quant='xs' requires channels=3 (RGB codec); use quant='raw'/'int4'/'int3' for mono")
         self.quant = quant
         self.group_size = group_size
         self.xs_mode = xs_mode
+        self.chroma420 = chroma420
         self.quant_bits = 8 if quant in ("raw", "xs") else (4 if quant == "int4" else 3)
         self.output_prefix = Path(output_prefix)
         self.output_prefix.parent.mkdir(parents=True, exist_ok=True)
@@ -172,7 +180,7 @@ class PixelCacheWriter:
         from .codec import (quantize_pixel_wavelet_adaptive, sparse_pack_meta,
                             sparse_pack_arena)
         t = torch.from_numpy(arr).to(torch.uint8)
-        meta, _ = quantize_pixel_wavelet_adaptive(t, mode=self.xs_mode)
+        meta, _ = quantize_pixel_wavelet_adaptive(t, mode=self.xs_mode, chroma420=self.chroma420)
         arena = sparse_pack_arena(sparse_pack_meta(meta))
         # Fixed-size training assumption: every sample shares the layout.
         shared = {
@@ -217,22 +225,53 @@ class PixelCacheWriter:
         """
         Appends an image to the raw memory map. Automatically resizes if needed.
         Supports quant="raw" (uint8) and quant="int4"/"int3" (packed + scales).
+        Mono caches (channels=1) accept grayscale input ([H,W], [H,W,1], PIL "L")
+        and reject 3-channel input; RGB caches accept both [H,W] (replicated) and 3ch.
         """
         if self.current_idx >= self.num_samples:
             raise ValueError(f"Exceeded pre-allocated sample count ({self.num_samples})")
-            
+
         if isinstance(img_input, (str, Path)):
             with Image.open(img_input) as im:
-                im = im.convert("RGB").resize((self.width, self.height), Image.Resampling.BILINEAR)
+                if self.channels == 3:
+                    im = im.convert("RGB")
+                else:
+                    if im.mode not in ("L", "I", "I;16", "F", "1", "LA"):
+                        raise ValueError(
+                            f"mono cache (channels=1) requires a grayscale image, got PIL mode {im.mode!r}")
+                    im = im.convert("L")
+                im = im.resize((self.width, self.height), Image.Resampling.BILINEAR)
                 arr = np.array(im, dtype=np.uint8)
         elif isinstance(img_input, Image.Image):
-            im = img_input.convert("RGB").resize((self.width, self.height), Image.Resampling.BILINEAR)
+            im = img_input
+            if self.channels == 3:
+                im = im.convert("RGB")
+            else:
+                if im.mode not in ("L", "I", "I;16", "F", "1", "LA"):
+                    raise ValueError(
+                        f"mono cache (channels=1) requires a grayscale image, got PIL mode {im.mode!r}")
+                im = im.convert("L")
+            im = im.resize((self.width, self.height), Image.Resampling.BILINEAR)
             arr = np.array(im, dtype=np.uint8)
         elif isinstance(img_input, torch.Tensor):
             arr = img_input.cpu().numpy().astype(np.uint8)
         else:
             arr = np.asarray(img_input, dtype=np.uint8)
-            
+
+        if arr.ndim == 2:
+            if self.channels == 3:
+                arr = np.repeat(arr[:, :, None], 3, axis=2)
+            else:
+                arr = arr.reshape(self.height, self.width, 1)
+        elif arr.ndim == 3 and arr.shape[2] == 1:
+            if self.channels == 3:
+                arr = np.repeat(arr, 3, axis=2)
+        elif arr.ndim == 3 and arr.shape[2] == 3:
+            if self.channels == 1:
+                raise ValueError("mono cache (channels=1) rejects 3-channel input; pass [H,W] grayscale")
+        else:
+            raise ValueError(f"unsupported image shape {arr.shape}")
+
         if self.quant == "raw":
             self.mmap_pixels[self.current_idx] = arr
         elif self.quant == "xs":
@@ -294,6 +333,7 @@ class PixelCacheWriter:
         }
         if self.quant == "xs":
             meta["xs_mode"] = self.xs_mode
+            meta["chroma420"] = self.chroma420
             meta["xs_files"] = {
                 "u8": os.path.basename(self.xs_u8_path),
                 "i8": os.path.basename(self.xs_i8_path),
@@ -630,6 +670,7 @@ def cache_images(
     width: int = 336,
     quant: str = "xs",
     xs_mode: str = "balanced",
+    chroma420: Optional[bool] = None,
     exts=_XS_IMAGE_EXTS,
     limit: Optional[int] = None,
     log_every: int = 500,
@@ -648,7 +689,8 @@ def cache_images(
         raise ValueError(f"no images ({'/'.join(exts)}) found under {src}")
     t0 = time.perf_counter()
     writer = PixelCacheWriter(output_prefix, num_samples=len(files), height=height,
-                              width=width, channels=3, quant=quant, xs_mode=xs_mode)
+                              width=width, channels=3, quant=quant, xs_mode=xs_mode,
+                              chroma420=chroma420)
     for i, f in enumerate(files):
         writer.append_image(str(f))
         if (i + 1) % log_every == 0:
@@ -669,6 +711,7 @@ def cache_images(
         "ms_per_img": dt / len(files) * 1000,
         "quant": quant,
         "xs_mode": xs_mode if quant == "xs" else None,
+        "chroma420": chroma420 if quant == "xs" else None,
     }
 
 

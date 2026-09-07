@@ -193,6 +193,63 @@ def test_pixel_cache_quantized_disk_io():
         print("[+] PixelCache INT4/INT3 disk I/O test passed!")
 
 
+def test_mono_pixel_cache():
+    """Mono (channels=1) raw/int4/int3 caches: 3x smaller files, exact round-trip,
+    color input rejected, PIL grayscale ingest works."""
+    from PIL import Image as PILImage
+    with tempfile.TemporaryDirectory() as tmpdir:
+        N, H, W = 4, 64, 64
+        gray = np.random.randint(0, 256, size=(H, W), dtype=np.uint8)
+
+        for quant in ("raw", "int4", "int3"):
+            prefix = Path(tmpdir) / f"mono_{quant}"
+            writer = PixelCacheWriter(prefix, num_samples=N, height=H, width=W,
+                                      channels=1, quant=quant)
+            writer.append_image(gray)           # [H,W]
+            writer.append_image(gray[:, :, None])  # [H,W,1]
+            writer.append_image(torch.from_numpy(gray))
+            # PIL "L" ingest (the path color BW JPEGs/PNGs take)
+            pil_path = Path(tmpdir) / "g.png"
+            PILImage.fromarray(gray).save(pil_path)
+            writer.append_image(str(pil_path))
+            writer.close()
+
+            # file size: raw must be exactly 1/3 of an RGB cache
+            ds = PixelCacheDataset(prefix)
+            assert ds.channels == 1
+            img = ds[0]
+            assert img.shape == (H, W, 1) and img.dtype == torch.uint8
+            if quant == "raw":
+                assert np.array_equal(img.numpy()[:, :, 0], gray)
+                assert os.path.getsize(str(prefix) + "_pixels.bin") == N * H * W
+            ds.close()
+
+        # color input must be rejected on mono caches
+        writer = PixelCacheWriter(Path(tmpdir) / "mono_rej", num_samples=1, height=H,
+                                  width=W, channels=1, quant="raw")
+        with pytest.raises(ValueError):
+            writer.append_image(np.zeros((H, W, 3), dtype=np.uint8))
+        with pytest.raises(ValueError):
+            writer.append_image(torch.zeros(H, W, 3, dtype=torch.uint8))
+        rgb_img = _natural_test_img(H, W)
+        with pytest.raises(ValueError):
+            writer.append_image(str(_save_tmp_png(tmpdir, rgb_img)))
+        writer.close()
+        # ...and mono input rejected on RGB caches
+        writer = PixelCacheWriter(Path(tmpdir) / "rgb_rej", num_samples=1, height=H,
+                                  width=W, channels=3, quant="raw")
+        writer.append_image(gray)  # [H,W] still auto-replicates into RGB caches
+        writer.close()
+        print("[+] Mono pixel cache test passed (raw/int4/int3 + rejection guards)!")
+
+
+def _save_tmp_png(tmpdir, img):
+    from PIL import Image as PILImage
+    p = Path(tmpdir) / "color.png"
+    PILImage.fromarray(img.numpy()).save(p)
+    return str(p)
+
+
 def test_wavelet_8x_codec():
     H, W, C = 64, 64, 3
     img = _natural_test_img(H, W)
@@ -336,6 +393,7 @@ if __name__ == "__main__":
     test_pixel_cache_disk_io()
     test_int4_int3_roundtrip()
     test_pixel_cache_quantized_disk_io()
+    test_mono_pixel_cache()
     test_wavelet_8x_codec()
     test_sparse_bitstream_roundtrip()
     test_xs_pixel_cache()

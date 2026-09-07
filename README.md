@@ -2,7 +2,7 @@
 
 **Ultra-fast, high-fidelity block-wise INT8 feature & pixel cache engine for PyTorch.**
 
-`pip install tcache` → `import tensorcache` or `import tcache` — `0.4.1` on [PyPI](https://pypi.org/project/tcache/).
+`pip install tcache` → `import tensorcache` or `import tcache` — `0.4.2` on [PyPI](https://pypi.org/project/tcache/).
 
 `tensorcache` eliminates two bottlenecks:
 1. **Feature Cache Bloat:** `AMO-BQ` asymmetric MSE-optimal `G32` `1.09B` `1.83x` vs BF16 `0.47%` `rel RMSE` (`sym 1.06B 0.54%`) — near `G16` floor `0.39%`.
@@ -22,6 +22,7 @@
 * **Cross-Platform:** `CUDA`/`ROCm` `Triton` else `PyTorch` fallback, `Windows` `mmap` safe `close()`.
 * **Tunable JPEG-XS Pixel:** `quantize_pixel_wavelet_adaptive(mode="balanced")` `lamb` `D+lamb*R` `G32 4b` `codebook 16` `TCQ-lite` `subband gains` `4:2:0` `sparse + zero-block skip + hier masks` `37dB 7.8x` (`44dB 3.2x` <-> `33dB 13.6x`, COCO val 336) `vs static 34dB 11.5x`.
 * **XS Image Pipeline (new):** `tc.cache_images(dir, prefix)` one-liner build → `tc.make_xs_loader(prefix, batch_size=256)` yields `uint8 [B,H,W,3]` on `CUDA` at `~10k img/s` sustained `@336` (`laptop 4050`, `file->GPU`, `workers=0`) — `6.7x` on `5000x COCO`, `GPU` mega-kernel batch decode (`K0/K1a/K1b/K1c/K2` + compiled synthesis, bit-exact), `spawn-safe` workers, `CPU` fallback bit-exact.
+* **Mono Grayscale Caches (v0.4.2):** `PixelCacheWriter(..., channels=1, quant=raw/int4/int3)` stores 1 sample/pixel — `3x` smaller (`110KB` vs `331KB` raw `336²`), grayscale-only ingest (color rejected, no silent conversion), `ds[i] -> uint8 [H,W,1]`. Mono `G=8` beats `RGB G=32` on both axes: `int4` RMSE `4.19` `83KB` vs `4.67` `186KB` — pass `group_size=8` for mono.
 * **CLI + Python one-liners:** `tc.compress` / `tc.benchmark_tensor` / `tensorcache benchmark`.
 
 ---
@@ -133,6 +134,34 @@ Throughput (`balanced`, `336²`, `laptop RTX 4050`, sustained medians):
 | `PIL JPEG` `8 workers` (status quo) | `~0.8-1k` | what training does today |
 
 `ViT-B` burns `~1-1.5k img/s/GPU` — the cache feeds `~10x` headroom on a laptop card while moving `43KB/img` (`~430MB/s H2D`, `PCIe` idle). Bigger GPUs just want bigger batches (`RTX PRO` saturates ~`BS256+`); `GB10` fits whole datasets in `128GB` unified memory. `CPU` fallback is bit-exact (`Windows`-safe, no `Triton` needed).
+
+Chroma is choosable: `cache_images(..., chroma420=False)` forces `4:4:4` (default auto: `ultra`/`high` → `4:4:4`, below → `4:2:0`), `chroma420=True` forces `4:2:0`. Same flag on `PixelCacheWriter`. Forcing `4:4:4` on `balanced` = `+1.4dB` for `+16%` bytes (`38.7dB` `96x` vs `37.3dB` `112x`, COCO `336`).
+
+### 2c. Mono Grayscale Pixel Caches (BW / grayscale JPEG-PNG / medical)
+```python
+import tensorcache as tc
+# 3x smaller than replicating gray to RGB; color input is rejected (no silent convert)
+writer = tc.PixelCacheWriter("./cache/mri336", 10000, 336, 336, channels=1,
+                             quant="int4", group_size=8)  # G=8 recommended for mono
+writer.append_image(gray)          # [H,W], [H,W,1], PIL "L"/"I;16", or path
+writer.close()
+
+ds = tc.PixelCacheDataset("./cache/mri336")
+img = ds[0]  # uint8 [H,W,1]; ViT wants 3ch? t.expand(H,W,3) is a free view
+```
+Measured (`1x COCO` img `336²`; RMSE of `0-255` values, bytes/img incl. scales):
+
+| config | RMSE | B/img | vs RGB G32 |
+|---|:---:|---:|:---:|
+| raw mono | `0` | `110K` | `3.0x` smaller |
+| int4 mono `G=32` | `5.88` | `62K` | `3.0x` smaller |
+| **int4 mono `G=8`** | **`4.19`** | `83K` | `2.2x` smaller **+ better fidelity** |
+| int4 mono `G=4` | `3.31` | `110K` | `1.7x` smaller, max fidelity |
+| int4 RGB `G=32` (replicated) | `4.67` | `186K` | — |
+| int3 mono `G=8` | `8.34` | `69K` | `2.1x` smaller + better |
+| int3 RGB `G=32` (replicated) | `9.65` | `145K` | — |
+
+Recommendation: mono caches should use `group_size=8` (or `4` for max fidelity) — blockwise scales adapt per `G` spatial pixels; mono `G=32` spans `3x` more pixels per block than RGB, so a smaller `G` recovers (and beats) RGB fidelity while staying far smaller. `quant="xs"` stays RGB-only (`~1%` overhead for true gray — chroma compresses to occupancy bits).
 
 ### 3. CLI
 ```bash
