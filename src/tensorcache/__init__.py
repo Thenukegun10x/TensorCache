@@ -69,7 +69,9 @@ from .feature_cache import (
 )
 from .pixel_cache import (
     PixelCacheWriter,
-    PixelCacheDataset
+    PixelCacheDataset,
+    cache_images,
+    make_xs_loader,
 )
 from .streamer import ZeroCopyTensorStreamer
 
@@ -133,6 +135,8 @@ __all__ = [
     "FeatureCacheDataset",
     "PixelCacheWriter",
     "PixelCacheDataset",
+    "cache_images",
+    "make_xs_loader",
     "ZeroCopyTensorStreamer",
 ]
 

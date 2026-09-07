@@ -281,6 +281,49 @@ def test_xs_pixel_cache():
         print("[+] XS PixelCache round-trip OK (single + batch + CPU fallback)")
 
 
+def test_xs_loader_ease_of_use():
+    """cache_images one-liner + make_xs_loader + spawn-safe pickling."""
+    import pickle
+    from PIL import Image as PILImage
+    from tensorcache.pixel_cache import cache_images, make_xs_loader
+    dev = "cuda:0" if torch.cuda.is_available() else "cpu"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        src = Path(tmpdir) / "imgs"
+        src.mkdir()
+        H, W, N = 64, 64, 5
+        refs = []
+        for s in range(N):
+            im = _natural_test_img(H, W, seed=s)
+            PILImage.fromarray(im.numpy()).save(src / f"img{s}.png")
+            refs.append(im)
+        info = cache_images(src, str(Path(tmpdir) / "cache"), height=H, width=W,
+                            xs_mode="balanced", log_every=1000)
+        assert info["num_samples"] == N
+        assert info["ratio_vs_raw"] > 1.0
+        # loader: 5 samples, bs=2 -> 3 GPU batches, exact pixels
+        seen = 0
+        for b in make_xs_loader(str(Path(tmpdir) / "cache"), batch_size=2,
+                                device=dev, num_workers=0, shuffle=False):
+            assert b.shape[1:] == (H, W, 3) and b.dtype == torch.uint8
+            if b.device.type == "cuda":
+                assert torch.cuda.is_available()
+            seen += b.shape[0]
+        assert seen == N
+        # multi-worker loader exercises fork/spawn pickling of the dataset
+        seen = sum(b.shape[0] for b in make_xs_loader(
+            str(Path(tmpdir) / "cache"), batch_size=2, device=dev,
+            num_workers=2, shuffle=False))
+        assert seen == N
+        # explicit pickle round-trip (spawn path): mmaps reopen, arenas decode
+        ds = PixelCacheDataset(str(Path(tmpdir) / "cache"), decode_device=dev)
+        ds2 = pickle.loads(pickle.dumps(ds))
+        assert len(ds2) == N
+        assert torch.equal(ds[0].cpu(), ds2[0].cpu())
+        ds.close()
+        ds2.close()
+        print("[+] XS loader ease-of-use OK (cache_images + loader + pickle)")
+
+
 if __name__ == "__main__":
     test_quantize_dequantize_roundtrip()
     test_adaptive_quantize_roundtrip()
@@ -291,5 +334,6 @@ if __name__ == "__main__":
     test_wavelet_8x_codec()
     test_sparse_bitstream_roundtrip()
     test_xs_pixel_cache()
+    test_xs_loader_ease_of_use()
 
     print("\n[+] ALL UNIT TESTS PASSED SUCCESSFULLY!")

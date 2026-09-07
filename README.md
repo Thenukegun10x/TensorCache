@@ -99,6 +99,20 @@ head = FusedDequantLinear(768, num_classes, group_size=32).cuda()
 logits = head(q, s) # dequant+GEMM in regs
 ```
 
+### 2b. XS Wavelet Image Cache (JPEG-XS style, GPU-decoded)
+```python
+import tensorcache as tc
+# One-liner build: dir of JPEGs/PNGs -> ~7.1x mmap cache (balanced default)
+info = tc.cache_images("data/coco_val", "./cache/coco336")
+# -> {"num_samples": 5000, "ratio_vs_raw": 7.1, "ms_per_img": 50, ...}
+
+# Training loop: workers slice arenas (CPU), main proc batch-decodes on GPU
+for imgs in tc.make_xs_loader("./cache/coco336", batch_size=256,
+                              device="cuda", num_workers=8):
+    train(imgs)  # uint8 [B,H,W,3] on CUDA, ~12k img/s sustained @336 (laptop 4050)
+```
+Fidelity presets (`xs_mode`): ultra 44.4dB 3.2x, high 39.8dB 5.6x, balanced 36.8dB 7.8x (default), compress 35.3dB 9.8x, ultra_comp 33.0dB 13.6x (16x COCO val, 1x uint8 baseline). CPU fallback is bit-exact (Windows-safe, no Triton needed).
+
 ### 3. CLI
 ```bash
 python -m tensorcache info

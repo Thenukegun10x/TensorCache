@@ -316,18 +316,20 @@ class PixelCacheDataset(Dataset):
     Supports quantized int4/int3 with blockwise dequant (PSNR 37/31dB), and XS wavelet
     arenas (quant="xs") with GPU batch decode (~12k img/s @336) via iter_batches.
     """
-    def __init__(self, cache_prefix: Union[str, Path], transform=None, decode_device: Optional[Union[str, torch.device]] = None):
+    def __init__(self, cache_prefix: Union[str, Path], transform=None, decode_device: Optional[Union[str, torch.device]] = None,
+                 as_arenas: bool = False):
         self.cache_prefix = Path(cache_prefix)
         self.meta_path = str(self.cache_prefix) + "_pixel_meta.json"
-        
+
         with open(self.meta_path, "r") as f:
             self.meta = json.load(f)
-            
+
         self.num_samples = self.meta["num_samples"]
         self.height = self.meta["height"]
         self.width = self.meta["width"]
         self.channels = self.meta["channels"]
         self.transform = transform
+        self.as_arenas = as_arenas
         self.quant = self.meta.get("quant", "raw")
         self.quant_bits = self.meta.get("quant_bits", 8 if self.quant=="raw" else (4 if self.quant=="int4" else 3))
         self.group_size = self.meta.get("group_size", 32)
@@ -335,7 +337,27 @@ class PixelCacheDataset(Dataset):
         if decode_device is None:
             decode_device = "cuda:0" if torch.cuda.is_available() else "cpu"
         self.decode_device = torch.device(decode_device)
-        
+        self._open_mmaps()
+
+    def __getstate__(self):
+        # Spawn-safe workers (Windows default): memmaps don't survive pickling
+        # (unpickling would secretly copy whole files to RAM), so drop them and
+        # reopen from prefix+meta on the other side.
+        st = self.__dict__.copy()
+        for k in ("mmap_pixels", "mmap_q", "mmap_scales",
+                  "_xs_u8", "_xs_i8", "_xs_meta", "_xs_ll4"):
+            st.pop(k, None)
+        return st
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        for k in ("mmap_pixels", "mmap_q", "mmap_scales",
+                  "_xs_u8", "_xs_i8", "_xs_meta", "_xs_ll4"):
+            setattr(self, k, None)
+        self._open_mmaps()
+
+    def _open_mmaps(self):
+        """(Re)open the read-only mmap handles. Used by __init__ and __setstate__."""
         if self.quant == "raw":
             self.bin_path = str(self.cache_prefix) + "_pixels.bin"
             # Fallback if meta has bin_file
@@ -432,10 +454,53 @@ class PixelCacheDataset(Dataset):
         Copies (not views): the read-only mmap is non-writable and torch
         refuses non-writable backing; bytes still come from page cache.
         """
+        return self.unpack_arena(self.get_arena_packed(idx))
+
+    def get_arena_packed(self, idx: int) -> dict:
+        """Single-tensor packed blob for sample idx (worker -> main transfer).
+
+        DataLoader IPC costs ~per tensor, not per byte: 5 tensors/sample
+        caps delivery at ~1k samp/s. One uint8 blob + a tiny header keeps
+        all 5 views reconstructible with zero copies (dtype views).
+        """
         if not self._xs:
-            raise RuntimeError("get_arena requires quant='xs'")
+            raise RuntimeError("get_arena_packed requires quant='xs'")
         r = self.meta["xs_table"][idx]
+        u8 = np.array(self._xs_u8[r["u8_off"]:r["u8_off"] + r["u8_len"]])
+        i8 = np.array(self._xs_i8[r["i8_off"]:r["i8_off"] + r["i8_len"]])
+        mt = np.array(self._xs_meta[r["meta_row"]:r["meta_row"] + r["n_planes"]])
+        l4 = np.array(self._xs_ll4[r["ll4_off"]:r["ll4_off"] + r["ll4_len"]])
+        # Pad the i8 section so the int32 meta view stays 4-aligned
+        # (deterministic from lengths; also keeps ll4 2-aligned).
+        pad = (-(u8.size + i8.size)) % 4
+        parts = [u8, i8.view(np.uint8),
+                 np.zeros(pad, dtype=np.uint8),
+                 mt.reshape(-1).view(np.uint8), l4.view(np.uint8)]
+        blob = np.concatenate(parts)
+        # Trailing pad keeps the whole blob a multiple of 4 (batch concat).
+        tail = (-blob.size) % 4
+        if tail:
+            blob = np.concatenate([blob, np.zeros(tail, dtype=np.uint8)])
+        assert blob.size == _packed_len(int(u8.size), int(i8.size),
+                                        int(mt.shape[0]), int(l4.size))
+        return {
+            "blob": torch.from_numpy(blob),
+            "u8_len": u8.size,
+            "i8_len": i8.size,
+            "n_planes": int(r["n_planes"]),
+            "ll4_len": int(r["ll4_len"]),
+        }
+
+    def unpack_arena(self, packed: dict) -> dict:
+        """Rebuild an xs-arena-v1 dict from a packed blob (views, no copies)."""
         sh = self._xs_shared
+        blob = packed["blob"]
+        u8_len, i8_len = int(packed["u8_len"]), int(packed["i8_len"])
+        n_planes, ll4_len = int(packed["n_planes"]), int(packed["ll4_len"])
+        P = int(sh["P"])
+        o1 = u8_len
+        o2 = o1 + i8_len + (-(u8_len + i8_len)) % 4  # skip alignment pad
+        o3 = o2 + n_planes * 8 * 4
         return {
             "format": "xs-arena-v1",
             "adaptive": bool(sh["adaptive"]),
@@ -444,15 +509,11 @@ class PixelCacheDataset(Dataset):
             "pad_w": int(sh["pad_w"]),
             "inv": self._xs_inv,
             "B": int(sh["B"]),
-            "P": int(sh["P"]),
-            "arena_u8": torch.from_numpy(
-                np.array(self._xs_u8[r["u8_off"]:r["u8_off"] + r["u8_len"]])),
-            "arena_i8": torch.from_numpy(
-                np.array(self._xs_i8[r["i8_off"]:r["i8_off"] + r["i8_len"]])),
-            "meta": torch.from_numpy(
-                np.array(self._xs_meta[r["meta_row"]:r["meta_row"] + r["n_planes"]])).to(torch.int32),
-            "ll4": torch.from_numpy(
-                np.array(self._xs_ll4[r["ll4_off"]:r["ll4_off"] + r["ll4_len"]])).to(torch.int16),
+            "P": P,
+            "arena_u8": blob[0:o1],
+            "arena_i8": blob[o1:o2].view(torch.int8),
+            "meta": blob[o2:o3].view(torch.int32).view(n_planes, 8),
+            "ll4": blob[o3:o3 + ll4_len * 2].view(torch.int16),
             "ll4_shapes": [tuple(s) for s in sh["ll4_shapes"]],
             "codebook": self._xs_codebook,
             "q_scale": sh.get("q_scale"),
@@ -498,6 +559,10 @@ class PixelCacheDataset(Dataset):
             yield self.decode_arenas([self.get_arena(i) for i in chunk], device=device)
 
     def __getitem__(self, idx: int) -> torch.Tensor:
+        if self.as_arenas:
+            # Worker-side slice for make_xs_loader (collated as a plain list,
+            # GPU batch-decoded in the main process).
+            return self.get_arena(idx)
         if self._xs:
             t = self.decode_arenas([self.get_arena(idx)], device=self.decode_device)[0].cpu()
             if self.transform is not None:
@@ -553,3 +618,174 @@ class PixelCacheDataset(Dataset):
             self.close()
         except Exception:
             pass
+
+
+_XS_IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
+
+
+def cache_images(
+    src: Union[str, Path],
+    output_prefix: Union[str, Path],
+    height: int = 336,
+    width: int = 336,
+    quant: str = "xs",
+    xs_mode: str = "balanced",
+    exts=_XS_IMAGE_EXTS,
+    limit: Optional[int] = None,
+    log_every: int = 500,
+) -> dict:
+    """One-liner: encode a directory of images into a PixelCache.
+
+    tensorcache.cache_images("data/coco_val", "./cache/coco336")
+    # -> {"num_samples": 5000, "bytes": ..., "ratio_vs_raw": 7.1, ...}
+    """
+    import time
+    src = Path(src)
+    files = sorted(p for p in src.rglob("*") if p.suffix.lower() in exts and p.is_file())
+    if limit is not None:
+        files = files[:limit]
+    if not files:
+        raise ValueError(f"no images ({'/'.join(exts)}) found under {src}")
+    t0 = time.perf_counter()
+    writer = PixelCacheWriter(output_prefix, num_samples=len(files), height=height,
+                              width=width, channels=3, quant=quant, xs_mode=xs_mode)
+    for i, f in enumerate(files):
+        writer.append_image(str(f))
+        if (i + 1) % log_every == 0:
+            print(f"  [{i + 1}/{len(files)}] {(time.perf_counter()-t0)/(i+1)*1000:.0f}ms/img",
+                  flush=True)
+    writer.close()
+    dt = time.perf_counter() - t0
+    out_dir = Path(output_prefix).parent
+    stem = Path(output_prefix).name
+    total = sum(p.stat().st_size for p in out_dir.iterdir()
+                if p.name.startswith(stem) and p.is_file())
+    raw = len(files) * height * width * 3
+    return {
+        "num_samples": len(files),
+        "bytes": total,
+        "raw_bytes": raw,
+        "ratio_vs_raw": raw / total,
+        "ms_per_img": dt / len(files) * 1000,
+        "quant": quant,
+        "xs_mode": xs_mode if quant == "xs" else None,
+    }
+
+
+def make_xs_loader(
+    cache_prefix: Union[str, Path],
+    batch_size: int = 32,
+    device: Optional[Union[str, torch.device]] = None,
+    num_workers: int = 0,
+    shuffle: bool = True,
+    drop_last: bool = False,
+    prefetch_factor: int = 2,
+    persistent_workers: Optional[bool] = None,
+    seed: Optional[int] = None,
+):
+    """Training-ready iterator yielding decoded uint8 [B,H,W,3] GPU batches.
+
+    Workers stay CPU-only (mmap arena slices); the main process batch-decodes
+    on GPU. num_workers=0 (default) is fastest here: delivery is ~30us/sample
+    from page cache with no IPC. With num_workers>0, each worker fans a whole
+    batch into ONE packed tensor (DataLoader IPC costs ~per transfer, so one
+    fat tensor/batch beats per-sample dicts ~5x) and the main process splits
+    it back into arena views (zero copies) before GPU decode. Typical next
+    step: `x = b.permute(0,3,1,2).float().div(255)` then normalize.
+
+    for imgs in tc.make_xs_loader("./cache/coco336", batch_size=256,
+                                  device="cuda", num_workers=8):
+        train(imgs)  # uint8 [B,H,W,3] on CUDA
+    """
+    from torch.utils.data import DataLoader
+    if device is None:
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    dev = torch.device(device)
+    ds = PixelCacheDataset(cache_prefix, decode_device="cpu", as_arenas=True)
+    if not ds._xs:
+        ds.close()
+        raise ValueError("make_xs_loader requires quant='xs' (this cache is "
+                         f"{ds.quant!r}; use a DataLoader over PixelCacheDataset directly)")
+    if num_workers > 0:
+        # Worker-side batch fan-in (one packed tensor per batch over IPC);
+        # main-side collate splits it back into arena views (zero copies).
+        # __getitems__ is DataLoader's hook for worker-side batching.
+        get_ds = _PackedArenaDataset(ds)
+        gen = torch.Generator().manual_seed(seed) if seed is not None else None
+        loader = DataLoader(
+            get_ds,
+            batch_size=batch_size, shuffle=shuffle, drop_last=drop_last,
+            num_workers=num_workers,
+            collate_fn=lambda bd: _split_batch_packed(bd, ds),
+            prefetch_factor=prefetch_factor,
+            persistent_workers=True if persistent_workers is None else persistent_workers,
+            generator=gen,
+        )
+    else:
+        if persistent_workers is None:
+            persistent_workers = False
+        loader = DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
+                            num_workers=0, collate_fn=lambda b: b,
+                            drop_last=drop_last)
+    try:
+        if dev.type in ("cuda", "hip"):
+            from .fused_ops import dequantize_sparse_wavelet_batch_gpu
+            for arena_batch in loader:
+                yield dequantize_sparse_wavelet_batch_gpu(arena_batch, device=device)
+        else:
+            for arena_batch in loader:
+                yield ds.decode_arenas(arena_batch, device=device)
+    finally:
+        ds.close()
+
+
+def _packed_len(u8_len: int, i8_len: int, n_planes: int, ll4_len: int) -> int:
+    """Total packed blob length: sections + alignment pads (multiple of 4).
+
+    Layout: [u8 | i8 | pad4 | meta(i32) | ll4(i16) | pad4]. Both pads are
+    deterministic from the header, so pack and split agree without metadata.
+    """
+    o2 = u8_len + i8_len + (-(u8_len + i8_len)) % 4
+    end = o2 + n_planes * 8 * 4 + ll4_len * 2
+    return end + (-end) % 4
+
+
+def _split_batch_packed(bd: dict, ds: PixelCacheDataset) -> list:
+    """Main-side split of a worker-fanned batch blob into arena dicts (views)."""
+    blob = bd["batch"]
+    out = []
+    pos = 0
+    for (u8, i8, n_planes, ll4) in bd["heads"]:
+        L = _packed_len(u8, i8, n_planes, ll4)
+        out.append(ds.unpack_arena({
+            "blob": blob[pos:pos + L],
+            "u8_len": u8, "i8_len": i8, "n_planes": n_planes, "ll4_len": ll4,
+        }))
+        pos += L
+    return out
+
+
+class _PackedArenaDataset(torch.utils.data.Dataset):
+    """Worker-side view: per-index packed blob, or whole-batch fan-in for lists.
+
+    DataLoader calls __getitems__ (when defined) with the index list instead
+    of looping __getitem__ — the fan-in concat happens worker-side, so IPC
+    ships one fat tensor per batch instead of per-sample dicts.
+    """
+
+    def __init__(self, ds: PixelCacheDataset):
+        self.ds = ds
+
+    def __len__(self) -> int:
+        return len(self.ds)
+
+    def __getitem__(self, idx: int) -> dict:
+        return self.ds.get_arena_packed(idx)
+
+    def __getitems__(self, idxs: list) -> dict:
+        blobs, heads = [], []
+        for i in idxs:
+            d = self.ds.get_arena_packed(i)
+            blobs.append(d["blob"])
+            heads.append((d["u8_len"], d["i8_len"], d["n_planes"], d["ll4_len"]))
+        return {"batch": torch.cat(blobs, dim=0), "heads": heads}
