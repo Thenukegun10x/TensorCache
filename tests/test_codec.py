@@ -27,6 +27,24 @@ from tensorcache.pixel_cache import PixelCacheWriter, PixelCacheDataset
 from tensorcache.prefetcher import AsyncGPUPrefetcher
 
 
+def _natural_test_img(H=64, W=64, seed=42):
+    """Test image with detailed luma but smooth (natural-like) chroma.
+
+    Blurred white RGB noise has near-white chroma, which is adversarial for
+    4:2:0 (aliasing). Real photos have smooth chroma, so share one luma
+    detail field across channels plus a smooth tint.
+    """
+    torch.manual_seed(seed)
+    raw = torch.randint(0, 256, (H, W), dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+    lum = torch.nn.functional.avg_pool2d(raw, kernel_size=3, stride=1, padding=1).squeeze()
+    yy, xx = torch.meshgrid(torch.linspace(0, 1, H), torch.linspace(0, 1, W), indexing="ij")
+    tint_r = 24 * torch.sin(2 * math.pi * yy) * torch.cos(2 * math.pi * xx)
+    tint_g = 20 * torch.cos(2 * math.pi * (xx + yy))
+    tint_b = -18 * torch.sin(2 * math.pi * (xx - yy))
+    img = torch.stack([lum + tint_r, lum + tint_g, lum + tint_b], dim=-1).clamp(0, 255).byte()
+    return img
+
+
 def test_quantize_dequantize_roundtrip():
     torch.manual_seed(42)
     x = torch.randn(16, 446, 768, dtype=torch.bfloat16)
@@ -176,11 +194,8 @@ def test_pixel_cache_quantized_disk_io():
 
 
 def test_wavelet_8x_codec():
-    torch.manual_seed(42)
     H, W, C = 64, 64, 3
-    # Natural image proxy with spatial correlation
-    raw = torch.randint(0, 256, (H, W, C), dtype=torch.float32).permute(2, 0, 1).unsqueeze(0)
-    img = torch.nn.functional.avg_pool2d(raw, kernel_size=3, stride=1, padding=1).squeeze(0).permute(1, 2, 0).byte()
+    img = _natural_test_img(H, W)
     
     packed_meta, shape = quantize_pixel_wavelet8x(img, q_scale=1.0)
     rec = dequantize_pixel_wavelet8x(packed_meta, device="cpu")
@@ -196,6 +211,35 @@ def test_wavelet_8x_codec():
     print(f"[+] 8x Wavelet Codec Verified! PSNR: {psnr:.2f} dB, Rel RMSE: {rmse:.2f}%")
 
 
+def test_sparse_bitstream_roundtrip():
+    from tensorcache.codec import (
+        sparse_pack_meta, sparse_unpack_meta, sparse_nbytes,
+        quantize_pixel_wavelet_adaptive, dequantize_pixel_wavelet_adaptive,
+    )
+    torch.manual_seed(7)
+    H, W, C = 64, 64, 3
+    img = _natural_test_img(H, W, seed=7)
+    raw_bytes = H * W * C
+
+    # static path: sparse round-trip must be bit-exact vs dense decode
+    meta, _ = quantize_pixel_wavelet8x(img, q_scale=3.0)
+    sp = sparse_pack_meta(meta)
+    assert sparse_nbytes(sp) < raw_bytes  # real compression, not dense storage
+    rec_sparse = dequantize_pixel_wavelet8x(sparse_unpack_meta(sp), device="cpu")
+    rec_dense = dequantize_pixel_wavelet8x(meta, device="cpu")
+    assert (rec_sparse == rec_dense).all()
+
+    # adaptive path
+    ameta, _ = quantize_pixel_wavelet_adaptive(img, mode="balanced")
+    asp = sparse_pack_meta(ameta)
+    assert sparse_nbytes(asp) < raw_bytes
+    rec_as = dequantize_pixel_wavelet_adaptive(sparse_unpack_meta(asp), device="cpu")
+    rec_ad = dequantize_pixel_wavelet_adaptive(ameta, device="cpu")
+    assert (rec_as == rec_ad).all()
+    print(f"[+] Sparse bitstream round-trip OK "
+          f"(static {raw_bytes/sparse_nbytes(sp):.2f}x, adaptive {raw_bytes/sparse_nbytes(asp):.2f}x)")
+
+
 if __name__ == "__main__":
     test_quantize_dequantize_roundtrip()
     test_adaptive_quantize_roundtrip()
@@ -204,5 +248,6 @@ if __name__ == "__main__":
     test_int4_int3_roundtrip()
     test_pixel_cache_quantized_disk_io()
     test_wavelet_8x_codec()
+    test_sparse_bitstream_roundtrip()
 
     print("\n[+] ALL UNIT TESTS PASSED SUCCESSFULLY!")

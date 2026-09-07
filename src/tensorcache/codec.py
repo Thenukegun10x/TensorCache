@@ -1013,38 +1013,37 @@ def rct_inverse(yuv: torch.Tensor) -> torch.Tensor:
 
 
 def dwt_53_1d(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """1D LeGall 5/3 (CDF 5/3) Wavelet Forward Lifting."""
+    """1D LeGall 5/3 (CDF 5/3) Wavelet Forward Lifting.
+
+    Pair sums are truncated to the output length, so odd-length signals work
+    (odd[j] pairs with even[j], even[j+1]).
+    """
     even = x[..., 0::2]
     odd = x[..., 1::2]
+    No = odd.shape[-1]
+    Ne = even.shape[-1]
     even_pad = F.pad(even, (0, 1), mode='replicate')
-    d = odd - ((even_pad[..., :-1] + even_pad[..., 1:]) >> 1)
-    d_pad = F.pad(d, (1, 0), mode='replicate')
-    s = even + ((d_pad[..., :-1] + d_pad[..., 1:] + 2) >> 2)
+    d = odd - ((even_pad[..., :-1] + even_pad[..., 1:]) >> 1)[..., :No]
+    d_pad = F.pad(d, (1, 1), mode='replicate')
+    s = even + ((d_pad[..., :-1] + d_pad[..., 1:] + 2) >> 2)[..., :Ne]
     return s, d
 
 
 def idwt_53_1d(s: torch.Tensor, d: torch.Tensor) -> torch.Tensor:
-    """1D LeGall 5/3 (CDF 5/3) Wavelet Inverse Lifting."""
-    d_pad = F.pad(d, (1, 0), mode='replicate')
-    even = s - ((d_pad[..., :-1] + d_pad[..., 1:] + 2) >> 2)
+    """1D LeGall 5/3 (CDF 5/3) Wavelet Inverse Lifting. Mirrors forward."""
+    Ns, Nd = s.shape[-1], d.shape[-1]
+    d_pad = F.pad(d, (1, 1), mode='replicate')
+    even = s - ((d_pad[..., :-1] + d_pad[..., 1:] + 2) >> 2)[..., :Ns]
     even_pad = F.pad(even, (0, 1), mode='replicate')
-    odd = d + ((even_pad[..., :-1] + even_pad[..., 1:]) >> 1)
+    odd = d + ((even_pad[..., :-1] + even_pad[..., 1:]) >> 1)[..., :Nd]
     out = torch.empty(s.shape[:-1] + (s.shape[-1] + d.shape[-1],), dtype=s.dtype, device=s.device)
     out[..., 0::2] = even
     out[..., 1::2] = odd
     return out
 
 
-def dwt_53_2d_step(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """1 step of 2D Wavelet forward lifting -> (LL, LH, HL, HH)."""
-    s_r, d_r = dwt_53_1d(x)
-    LL, LH = dwt_53_1d(s_r.transpose(-2, -1))
-    HL, HH = dwt_53_1d(d_r.transpose(-2, -1))
-    return LL.transpose(-2, -1), LH.transpose(-2, -1), HL.transpose(-2, -1), HH.transpose(-2, -1)
-
-
 def _dwt_53_2d_step_batched(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Batched 2D DWT for [B, H, W] -> 4x [B, H/2, W/2]. Vectorized over B=3 for GPU on-the-fly."""
+    """Batched 2D 5/3 DWT for [B, H, W] -> 4x [B, H/2, W/2]."""
     s_r, d_r = dwt_53_1d(x)  # [B, H, W/2]
     # Column lift via transposed row lift
     LL_T, LH_T = dwt_53_1d(s_r.transpose(-2, -1))  # [B, W/2, H/2]
@@ -1056,53 +1055,94 @@ def _dwt_53_2d_step_batched(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor
     return LL, LH, HL, HH
 
 
-def idwt_53_2d_step(LL: torch.Tensor, LH: torch.Tensor, HL: torch.Tensor, HH: torch.Tensor) -> torch.Tensor:
-    """1 step of 2D Wavelet inverse lifting -> original spatial plane."""
+def _idwt_53_2d_step_batched(LL: torch.Tensor, LH: torch.Tensor, HL: torch.Tensor, HH: torch.Tensor) -> torch.Tensor:
+    """Batched 2D 5/3 IDWT for [B, Hs, Ws] -> [B, H, W] where H=2*Hs, W=2*Ws."""
+    # Column lift via transposed row lift
     s_r = idwt_53_1d(LL.transpose(-2, -1), LH.transpose(-2, -1)).transpose(-2, -1)
     d_r = idwt_53_1d(HL.transpose(-2, -1), HH.transpose(-2, -1)).transpose(-2, -1)
     return idwt_53_1d(s_r, d_r)
 
 
+def _downsample2(x: torch.Tensor) -> torch.Tensor:
+    """2x box downsample [B, H, W] int32 -> [B, H/2, W/2] (H, W even)."""
+    return ((x[:, 0::2, 0::2] + x[:, 0::2, 1::2]
+             + x[:, 1::2, 0::2] + x[:, 1::2, 1::2] + 2) >> 2)
+
+
+def _upsample2(x: torch.Tensor) -> torch.Tensor:
+    """2x nearest upsample [B, H, W] -> [B, 2H, 2W].
+
+    Measured against a grid-matched tent ((3a+b)/4 and cell-copy variants) on
+    COCO chroma: nearest wins by ~1dB — subsampled chroma here is
+    high-frequency dominated (already JPEG-mangled), so neighbor averaging
+    adds error. Also the cheapest option. Trivially bit-exact CPU/CUDA.
+    """
+    return x.repeat_interleave(2, dim=-1).repeat_interleave(2, dim=-2)
+
+
 def quantize_pixel_wavelet8x(
     img: torch.Tensor | np.ndarray,
-    q_scale: float = 3.0
+    q_scale: float = 3.0,
+    chroma420: bool = True,
 ) -> Tuple[dict, Tuple[int, int, int]]:
     """
     Quantize an RGB image tensor or array using 4-Level Dyadic Wavelet Lifting (JPEG-XS Style).
-    Achieves ~8.0x compression with sub-1% pixel relative error (>40 dB PSNR).
-    Batched GPU path: 3 channels in parallel via _dwt_53_2d_step_batched -> 3x fewer launches for on-the-fly.
+    chroma420=True (default): luma 4 DWT levels at full res, chroma 3 levels
+      at half res (planes named by spatial equivalence; only L1 is luma-only).
+    chroma420=False: full-res 4:4:4 chroma (all 3 channels have L1).
+    Batched GPU path: channels in parallel via _dwt_53_2d_step_batched.
     """
     if isinstance(img, np.ndarray):
         t = torch.from_numpy(img).to(torch.int32)
     else:
         t = img.to(torch.int32)
-    
+
     H, W, C = t.shape
-    # Pad to multiple of 16 for 4 levels of DWT
+    # Pad to multiple of 16 for 4 luma levels of DWT (chroma half-res => mult of 8, 3 levels)
     pad_h = (16 - H % 16) % 16
     pad_w = (16 - W % 16) % 16
     if pad_h > 0 or pad_w > 0:
         t = F.pad(t.permute(2, 0, 1), (0, pad_w, 0, pad_h), mode='replicate').permute(1, 2, 0)
-    
-    # Batched PyTorch path: YCbCr -> [3, Hp, Wp] then 4-level DWT batched
-    # This is GPU on-the-fly: if t is on cuda, all ops run as CUDA kernels (F.pad, div etc) with 3x fewer launches
-    # No separate Triton needed for encode - DWT is memory-bound and torch's kernels are already coalesced
-    # This is ~3x faster than per-channel loop and enables GPU vectorization
+
+    # RCT -> luma full-res + chroma full or half res
+    # GPU on-the-fly: if t is on cuda, all ops run as CUDA kernels
     yuv = rct_forward(t)  # [Hp, Wp, 3]
-    yuv_batched = yuv.permute(2, 0, 1).contiguous()  # [3, Hp, Wp] int32
+    yuv_b = yuv.permute(2, 0, 1).contiguous()  # [3, Hp, Wp] int32
+    Y = yuv_b[0:1]  # [1, Hp, Wp]
+    Cc = _downsample2(yuv_b[1:3]) if chroma420 else yuv_b[1:3]  # [2, Hc, Wc] or [2, Hp, Wp]
 
-    # 4-level DWT batched
-    LL1, LH1, HL1, HH1 = _dwt_53_2d_step_batched(yuv_batched)
-    LL2, LH2, HL2, HH2 = _dwt_53_2d_step_batched(LL1)
-    LL3, LH3, HL3, HH3 = _dwt_53_2d_step_batched(LL2)
-    LL4, LH4, HL4, HH4 = _dwt_53_2d_step_batched(LL3)
+    # Luma 4-level DWT; chroma 3-level (420) or 4-level (444) DWT
+    YL1, YLH1, YHL1, YHH1 = _dwt_53_2d_step_batched(Y)
+    YL2, YLH2, YHL2, YHH2 = _dwt_53_2d_step_batched(YL1)
+    YL3, YLH3, YHL3, YHH3 = _dwt_53_2d_step_batched(YL2)
+    YL4, YLH4, YHL4, YHH4 = _dwt_53_2d_step_batched(YL3)
+    if chroma420:
+        CL2, CLH2, CHL2, CHH2 = _dwt_53_2d_step_batched(Cc)
+        CL3, CLH3, CHL3, CHH3 = _dwt_53_2d_step_batched(CL2)
+        CL4, CLH4, CHL4, CHH4 = _dwt_53_2d_step_batched(CL3)
+    else:
+        CL1, CLH1, CHL1, CHH1 = _dwt_53_2d_step_batched(Cc)
+        CL2, CLH2, CHL2, CHH2 = _dwt_53_2d_step_batched(CL1)
+        CL3, CLH3, CHL3, CHH3 = _dwt_53_2d_step_batched(CL2)
+        CL4, CLH4, CHL4, CHH4 = _dwt_53_2d_step_batched(CL3)
 
-    # Per-channel deadzone steps [3]
-    # c_f =1.0 for Y, 1.8 for Cb/Cr
-    q_l4 = torch.tensor([max(1, int(round(q_scale*0.5*1.0))), max(1, int(round(q_scale*0.5*1.8))), max(1, int(round(q_scale*0.5*1.8)))], device=yuv_batched.device)
-    q_l3 = torch.tensor([max(1, int(round(q_scale*1.0*1.0))), max(1, int(round(q_scale*1.0*1.8))), max(1, int(round(q_scale*1.0*1.8)))], device=yuv_batched.device)
-    q_l2 = torch.tensor([max(1, int(round(q_scale*2.0*1.0))), max(1, int(round(q_scale*2.0*1.8))), max(1, int(round(q_scale*2.0*1.8)))], device=yuv_batched.device)
-    q_l1 = torch.tensor([max(1, int(round(q_scale*4.0*1.0))), max(1, int(round(q_scale*4.0*1.8))), max(1, int(round(q_scale*4.0*1.8)))], device=yuv_batched.device)
+    # Per-level deadzone steps [3]: luma c_f=1.0, chroma c_f=1.8 at the
+    # spatially equivalent level (chroma L2 <-> luma L2, etc.)
+    dev = yuv_b.device
+    q_l4 = torch.tensor([max(1, int(round(q_scale*0.5*1.0))), max(1, int(round(q_scale*0.5*1.8))), max(1, int(round(q_scale*0.5*1.8)))], device=dev)
+    q_l3 = torch.tensor([max(1, int(round(q_scale*1.0*1.0))), max(1, int(round(q_scale*1.0*1.8))), max(1, int(round(q_scale*1.0*1.8)))], device=dev)
+    q_l2 = torch.tensor([max(1, int(round(q_scale*2.0*1.0))), max(1, int(round(q_scale*2.0*1.8))), max(1, int(round(q_scale*2.0*1.8)))], device=dev)
+    q_l1 = torch.tensor([max(1, int(round(q_scale*4.0*1.0))), max(1, int(round(q_scale*4.0*1.8))), max(1, int(round(q_scale*4.0*1.8)))], device=dev)
+
+    # Stack levels across channels (shapes match by spatial-equivalence naming)
+    def stk(*planes):
+        return torch.cat(planes, dim=0)
+    LL4 = stk(YL4, CL4)  # [3, H4, W4]
+    LH4, HL4, HH4 = stk(YLH4, CLH4), stk(YHL4, CHL4), stk(YHH4, CHH4)
+    LH3, HL3, HH3 = stk(YLH3, CLH3), stk(YHL3, CHL3), stk(YHH3, CHH3)
+    LH2, HL2, HH2 = stk(YLH2, CLH2), stk(YHL2, CHL2), stk(YHH2, CHH2)
+    if not chroma420:
+        LH1, HL1, HH1 = stk(YLH1, CLH1), stk(YHL1, CHL1), stk(YHH1, CHH1)
 
     # Quantize batched: [3, H, W] / [3,1,1] -> int8
     LL4_q = LL4.to(torch.int16)  # keep per-plane int16
@@ -1119,31 +1159,65 @@ def quantize_pixel_wavelet8x(
     HL2_q = torch.div(HL2, q_l2.view(3,1,1), rounding_mode='trunc').to(torch.int8)
     HH2_q = torch.div(HH2, (q_l2*2).view(3,1,1), rounding_mode='trunc').to(torch.int8)
 
-    LH1_q = torch.div(LH1, q_l1.view(3,1,1), rounding_mode='trunc').to(torch.int8)
-    HL1_q = torch.div(HL1, q_l1.view(3,1,1), rounding_mode='trunc').to(torch.int8)
-    # HH1: zero for chroma as in original (saves bits, ~0.02dB loss)
-    HH1_q_full = torch.div(HH1, (q_l1*2).view(3,1,1), rounding_mode='trunc').to(torch.int8)
-    # Zero out chroma HH1
-    HH1_q_full[1:] = 0
-    HH1_q = HH1_q_full
+    if chroma420:
+        # L1 luma-only; zero chroma HH at its finest level (L2)
+        LH1_q = torch.div(YLH1, int(q_l1[0]), rounding_mode='trunc').to(torch.int8)
+        HL1_q = torch.div(YHL1, int(q_l1[0]), rounding_mode='trunc').to(torch.int8)
+        HH1_q = torch.div(YHH1, int(q_l1[0])*2, rounding_mode='trunc').to(torch.int8)
+        HH2_q[1:] = 0
+    else:
+        LH1_q = torch.div(LH1, q_l1.view(3,1,1), rounding_mode='trunc').to(torch.int8)
+        HL1_q = torch.div(HL1, q_l1.view(3,1,1), rounding_mode='trunc').to(torch.int8)
+        HH1_q = torch.div(HH1, (q_l1*2).view(3,1,1), rounding_mode='trunc').to(torch.int8)
+        HH1_q[1:] = 0
 
-    # Unbatch to list of dicts for backward compat (PixelCache etc expects per-channel)
+    # Unbatch to list of dicts (420 chroma dicts have no L1 key)
     encoded_channels = []
     for c in range(3):
-        encoded_channels.append({
+        d = {
             'LL4': LL4_q[c],
             'L4': (LH4_q[c], HL4_q[c], HH4_q[c], int(q_l4[c].item())),
             'L3': (LH3_q[c], HL3_q[c], HH3_q[c], int(q_l3[c].item())),
             'L2': (LH2_q[c], HL2_q[c], HH2_q[c], int(q_l2[c].item())),
-            'L1': (LH1_q[c], HL1_q[c], HH1_q[c], int(q_l1[c].item())),
-        })
+        }
+        if c == 0 or not chroma420:
+            d['L1'] = (LH1_q[c if not chroma420 else 0], HL1_q[c if not chroma420 else 0],
+                       HH1_q[c if not chroma420 else 0], int(q_l1[c].item()))
+        encoded_channels.append(d)
 
     return {
         'channels': encoded_channels,
         'pad_h': pad_h,
         'pad_w': pad_w,
-        'orig_shape': (H, W, C)
+        'orig_shape': (H, W, C),
+        'chroma420': chroma420,
     }, (H, W, C)
+
+
+def _dequant_static_plane(q: torch.Tensor, step: torch.Tensor) -> torch.Tensor:
+    """Deadzone-aware reconstruction: bin centroid instead of bin edge.
+
+    Quantize truncates toward zero (deadzone 2*step), so reconstruct at
+    k*step + sign(k)*step//2. Zero bin is unaffected. Must match bit-exactly
+    in all decode paths (CPU stacks + Triton fused).
+    """
+    qi = q.to(torch.int32)
+    return qi * step + torch.sign(qi) * (step // 2)
+
+
+def _chroma_is_subsampled(packed_meta: dict) -> bool:
+    """4:2:0 iff chroma dicts lack finest-level keys (4:4:4 keeps full-res chroma).
+
+    Handles both schemas: static level keys ('L1') and adaptive plane keys
+    ('LH1'/'HL1'/'HH1').
+    """
+    ch = packed_meta['channels']
+    if len(ch) <= 1:
+        return True
+    c1 = ch[1]
+    if 'L1' in c1 or 'LH1' in c1 or 'HL1' in c1 or 'HH1' in c1:
+        return False
+    return True
 
 
 def _wavelet_batched_stacks(packed_meta: dict, dev: torch.device):
@@ -1153,33 +1227,32 @@ def _wavelet_batched_stacks(packed_meta: dict, dev: torch.device):
     LL4 = torch.stack([c['LL4'].to(dev).to(torch.int32) for c in channels_data], dim=0)
     # Level 4
     q4 = torch.tensor([c['L4'][3] for c in channels_data], device=dev, dtype=torch.int32).view(3, 1, 1)
-    LH4 = torch.stack([c['L4'][0] for c in channels_data], dim=0).to(dev).to(torch.int32) * q4
-    HL4 = torch.stack([c['L4'][1] for c in channels_data], dim=0).to(dev).to(torch.int32) * q4
-    HH4 = torch.stack([c['L4'][2] for c in channels_data], dim=0).to(dev).to(torch.int32) * (q4 * 2)
+    LH4 = _dequant_static_plane(torch.stack([c['L4'][0] for c in channels_data], dim=0).to(dev), q4)
+    HL4 = _dequant_static_plane(torch.stack([c['L4'][1] for c in channels_data], dim=0).to(dev), q4)
+    HH4 = _dequant_static_plane(torch.stack([c['L4'][2] for c in channels_data], dim=0).to(dev), q4 * 2)
     # Level 3
     q3 = torch.tensor([c['L3'][3] for c in channels_data], device=dev, dtype=torch.int32).view(3, 1, 1)
-    LH3 = torch.stack([c['L3'][0] for c in channels_data], dim=0).to(dev).to(torch.int32) * q3
-    HL3 = torch.stack([c['L3'][1] for c in channels_data], dim=0).to(dev).to(torch.int32) * q3
-    HH3 = torch.stack([c['L3'][2] for c in channels_data], dim=0).to(dev).to(torch.int32) * (q3 * 2)
+    LH3 = _dequant_static_plane(torch.stack([c['L3'][0] for c in channels_data], dim=0).to(dev), q3)
+    HL3 = _dequant_static_plane(torch.stack([c['L3'][1] for c in channels_data], dim=0).to(dev), q3)
+    HH3 = _dequant_static_plane(torch.stack([c['L3'][2] for c in channels_data], dim=0).to(dev), q3 * 2)
     # Level 2
     q2 = torch.tensor([c['L2'][3] for c in channels_data], device=dev, dtype=torch.int32).view(3, 1, 1)
-    LH2 = torch.stack([c['L2'][0] for c in channels_data], dim=0).to(dev).to(torch.int32) * q2
-    HL2 = torch.stack([c['L2'][1] for c in channels_data], dim=0).to(dev).to(torch.int32) * q2
-    HH2 = torch.stack([c['L2'][2] for c in channels_data], dim=0).to(dev).to(torch.int32) * (q2 * 2)
-    # Level 1
-    q1 = torch.tensor([c['L1'][3] for c in channels_data], device=dev, dtype=torch.int32).view(3, 1, 1)
-    LH1 = torch.stack([c['L1'][0] for c in channels_data], dim=0).to(dev).to(torch.int32) * q1
-    HL1 = torch.stack([c['L1'][1] for c in channels_data], dim=0).to(dev).to(torch.int32) * q1
-    HH1 = torch.stack([c['L1'][2] for c in channels_data], dim=0).to(dev).to(torch.int32) * (q1 * 2)
+    LH2 = _dequant_static_plane(torch.stack([c['L2'][0] for c in channels_data], dim=0).to(dev), q2)
+    HL2 = _dequant_static_plane(torch.stack([c['L2'][1] for c in channels_data], dim=0).to(dev), q2)
+    HH2 = _dequant_static_plane(torch.stack([c['L2'][2] for c in channels_data], dim=0).to(dev), q2 * 2)
+    # Level 1: all 3 channels in 4:4:4 mode, luma-only under 4:2:0
+    if _chroma_is_subsampled(packed_meta):
+        yc = channels_data[0]
+        q1 = torch.tensor([yc['L1'][3]], device=dev, dtype=torch.int32).view(1, 1, 1)
+        LH1 = _dequant_static_plane(torch.stack([yc['L1'][0]], dim=0).to(dev), q1)
+        HL1 = _dequant_static_plane(torch.stack([yc['L1'][1]], dim=0).to(dev), q1)
+        HH1 = _dequant_static_plane(torch.stack([yc['L1'][2]], dim=0).to(dev), q1 * 2)
+    else:
+        q1 = torch.tensor([c['L1'][3] for c in channels_data], device=dev, dtype=torch.int32).view(3, 1, 1)
+        LH1 = _dequant_static_plane(torch.stack([c['L1'][0] for c in channels_data], dim=0).to(dev), q1)
+        HL1 = _dequant_static_plane(torch.stack([c['L1'][1] for c in channels_data], dim=0).to(dev), q1)
+        HH1 = _dequant_static_plane(torch.stack([c['L1'][2] for c in channels_data], dim=0).to(dev), q1 * 2)
     return LL4, (LH4, HL4, HH4), (LH3, HL3, HH3), (LH2, HL2, HH2), (LH1, HL1, HH1)
-
-
-def _idwt_53_2d_step_batched(LL: torch.Tensor, LH: torch.Tensor, HL: torch.Tensor, HH: torch.Tensor) -> torch.Tensor:
-    """Batched 2D IDWT for [B, Hs, Ws] -> [B, H, W] where H=2*Hs, W=2*Ws. Vectorized over B=3."""
-    # Column lift via transposed row lift
-    s_r = idwt_53_1d(LL.transpose(-2, -1), LH.transpose(-2, -1)).transpose(-2, -1)
-    d_r = idwt_53_1d(HL.transpose(-2, -1), HH.transpose(-2, -1)).transpose(-2, -1)
-    return idwt_53_1d(s_r, d_r)
 
 
 def dequantize_pixel_wavelet8x(
@@ -1208,14 +1281,24 @@ def dequantize_pixel_wavelet8x(
     channels_data = packed_meta['channels']
     H, W, C = packed_meta['orig_shape']
 
-    # Batched PyTorch path: stack 3 channels -> 3x fewer kernel launches, 4-stage fused
+    # Batched PyTorch path: 4:4:4 -> full 4-stage chain on [3, ...];
+    # 4:2:0 -> luma 4-stage chain + chroma 3-stage chain + 2x upsample
     LL4, (LH4, HL4, HH4), (LH3, HL3, HH3), (LH2, HL2, HH2), (LH1, HL1, HH1) = _wavelet_batched_stacks(packed_meta, dev)
 
-    # 4-stage inverse synthesis batched [3, H, W]
-    rec_ll3 = _idwt_53_2d_step_batched(LL4, LH4, HL4, HH4)  # [3, 42, 42] for 336
-    rec_ll2 = _idwt_53_2d_step_batched(rec_ll3, LH3, HL3, HH3)
-    rec_ll1 = _idwt_53_2d_step_batched(rec_ll2, LH2, HL2, HH2)
-    rec_yuv_batched = _idwt_53_2d_step_batched(rec_ll1, LH1, HL1, HH1)  # [3, Hp, Wp]
+    if not _chroma_is_subsampled(packed_meta):
+        rec_ll3 = _idwt_53_2d_step_batched(LL4, LH4, HL4, HH4)
+        rec_ll2 = _idwt_53_2d_step_batched(rec_ll3, LH3, HL3, HH3)
+        rec_ll1 = _idwt_53_2d_step_batched(rec_ll2, LH2, HL2, HH2)
+        rec_yuv_batched = _idwt_53_2d_step_batched(rec_ll1, LH1, HL1, HH1)  # [3, Hp, Wp]
+    else:
+        # LL4/L4/L3/L2 stacks are [3, ...] (Y + subsampled C); L1 is [1, ...] (Y only)
+        rec_ll3 = _idwt_53_2d_step_batched(LL4, LH4, HL4, HH4)  # [3, Hp/8]
+        rec_ll2_y = _idwt_53_2d_step_batched(rec_ll3[0:1], LH3[0:1], HL3[0:1], HH3[0:1])
+        rec_ll2_c = _idwt_53_2d_step_batched(rec_ll3[1:3], LH3[1:3], HL3[1:3], HH3[1:3])
+        rec_ll1_y = _idwt_53_2d_step_batched(rec_ll2_y, LH2[0:1], HL2[0:1], HH2[0:1])
+        rec_c_half = _idwt_53_2d_step_batched(rec_ll2_c, LH2[1:3], HL2[1:3], HH2[1:3])  # [2, Hc, Wc]
+        rec_y = _idwt_53_2d_step_batched(rec_ll1_y, LH1, HL1, HH1)  # [1, Hp, Wp]
+        rec_yuv_batched = torch.cat([rec_y, _upsample2(rec_c_half)], dim=0)  # [3, Hp, Wp]
 
     # RCT inverse: [3, Hp, Wp] -> [Hp, Wp, 3]
     rec_yuv = rec_yuv_batched.permute(1, 2, 0)  # [Hp, Wp, 3]
@@ -1231,16 +1314,32 @@ def dequantize_pixel_wavelet8x(
 # =============================================================================
 # TUNABLE ADAPTIVE WAVELET (XS-native RDO, 4b idx, GPU/CPU)
 # =============================================================================
-# Default 8-entry codebook for m, 4b per block (0.125b/elem). Quant step = base_q * m.
+# Default 16-entry codebook for m, 4b per block (0.125b/elem). Quant step = base_q * m.
+# All 16 nibble values used (was 8 of 16) at zero extra bit cost.
 # Base q per level: q_l4=0.5*q_scale*c_f, q_l3=1.0*, q_l2=2*, q_l1=4*
-ADAPTIVE_CODEBOOK = torch.tensor([0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0], dtype=torch.float32)
+ADAPTIVE_CODEBOOK = torch.tensor(
+    [0.5, 0.625, 0.75, 0.875, 1.0, 1.125, 1.25, 1.375,
+     1.5, 1.625, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0], dtype=torch.float32)
+# Measured synthesis energy gains (pixel_SSE / coeff_SSE) through float 5/3
+# IDWT (no rounding noise), normalized to LH1=1.0 (see benchmarks/xs_gains.py).
+# LH/HL pairs identical (transform is exactly symmetric).
+# RDO multiplies by RCT channel energy: Y=3.0, Cb/Cr=0.69 (traced integer ops).
+SUBBAND_GAINS = {
+    "LH4": 30.165, "HL4": 30.165, "HH4": 8.589,
+    "LH3": 7.907, "HL3": 7.907, "HH3": 2.333,
+    "LH2": 2.351, "HL2": 2.351, "HH2": 0.788,
+    "LH1": 1.000, "HL1": 1.000, "HH1": 0.479,
+}
+RCT_GAIN_Y = 3.0
+RCT_GAIN_C = 0.69
 # Tunable presets: q_scale, lamb  (lamb trades D vs R in RDO)
+# Measured on 16x COCO val 336^2 with sparse bitstream (PSNR dB / actual ratio):
 WAVELET_ADAPTIVE_PRESETS = {
-    "ultra":      (1.0, 1.0),   # ~41.6dB 6.6x MAE 1.6 highest fidelity
-    "high":       (3.0, 5.0),   # ~38.0dB 9.4x MAE 2.5 balanced high quality
-    "balanced":   (3.0, 10.0),  # ~36.2dB 11.8x MAE 3.0 default
-    "compress":   (5.0, 20.0),  # ~34.7dB 14.5x MAE 3.6 high compress
-    "ultra_comp": (8.0, 50.0),  # ~33.6dB 17x MAE 4.0 max compress
+    "ultra":      (1.0, 1.0),   # ~44.8dB 2.99x highest fidelity (4:4:4)
+    "high":       (3.0, 5.0),   # ~40.1dB 4.98x balanced high quality (4:4:4)
+    "balanced":   (3.0, 10.0),  # ~37.0dB 6.94x default (4:2:0)
+    "compress":   (5.0, 20.0),  # ~35.5dB 8.72x high compress (4:2:0)
+    "ultra_comp": (8.0, 50.0),  # ~33.1dB 12.1x max compress (4:2:0)
 }
 
 def _pack_4b(idx: torch.Tensor) -> torch.Tensor:
@@ -1274,10 +1373,15 @@ def _quant_adaptive_plane(
     codebook: torch.Tensor,  # [C] float
     lamb: float,
     G: int = 32,
+    gain: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Per-block RDO for one plane. Returns (q_int8 [H,W], idx_packed uint8 [(M+1)//2], rec_int32 [H,W]).
     GPU/CPU agnostic - runs on coeff.device.
+    Rate uses the true sparse-bitstream price: 1 bit for an all-zero block
+    (occupancy only), else 1 occ + 1 mode + min(32 flat, 8+4k hier) mask bits
+    + 4 idx bits + 8 per nonzero coefficient (k = nonempty nibbles).
+    Distortion is weighted by the subband synthesis gain (pixel_SSE/coeff_SSE).
     """
     H, W = coeff.shape
     flat = coeff.flatten().float()
@@ -1294,16 +1398,35 @@ def _quant_adaptive_plane(
     # Vectorized RDO: cand_q [M,C,G], cand_rec [M,C,G]
     cand_q = torch.round(blocks.unsqueeze(1) / steps).clamp(-128, 127)
     cand_rec = cand_q * steps
-    D = ((blocks.unsqueeze(1) - cand_rec) ** 2).sum(-1)  # [M,C]
-    R = (cand_q != 0).sum(-1).float() * 8 + 4  # 4b idx + 8b per nonzero
+    D = ((blocks.unsqueeze(1) - cand_rec) ** 2).sum(-1) * gain  # [M,C]
+    nnz = (cand_q != 0).sum(-1).float()  # [M,C]
+    if G == 32:
+        # True hierarchical-mask price: 1 occ bit; empty blocks stop there.
+        # Occupied: +1 mode bit + min(32 flat, 8+4k hier) mask bits + 4 idx + 8/coeff,
+        # k = #nonempty nibbles (hier wins iff k<=5).
+        k = (cand_q.view(M, C, 8, 4) != 0).any(-1).sum(-1).float()  # [M,C]
+        maskbits = torch.where(k <= 5, 8.0 + 4.0 * k, torch.full_like(k, 32.0))
+        R = torch.where(nnz == 0, torch.ones_like(nnz), 6.0 + maskbits + 8.0 * nnz)
+    else:
+        R = torch.where(nnz == 0, torch.ones_like(nnz), 37.0 + 8.0 * nnz)
     cost = D + lamb * R
     best = cost.argmin(-1)  # [M]
     best_steps = cand_steps[best]  # [M]
     q_blocks = torch.round(blocks / best_steps.unsqueeze(-1)).clamp(-128, 127).to(torch.int8)
+    # TCQ-lite refinement: per-coefficient choice among {q0-1, q0, q0+1}.
+    # Exact (not approximate): given the block step, rate is additive per
+    # coefficient (8b iff nonzero), so independent per-coeff argmin is optimal.
+    # No trellis/state needed. Block step (idx) unchanged -> format untouched.
+    s = best_steps.unsqueeze(-1)  # [M,1]
+    q0 = q_blocks.to(torch.int16)
+    qc = torch.stack([q0 - 1, q0, q0 + 1], dim=-1).clamp(-128, 127)  # [M,G,3]
+    dc = gain * (blocks.unsqueeze(-1).float() - qc.float() * s.unsqueeze(-1).float()) ** 2
+    rc = lamb * 8.0 * (qc != 0).float()
+    q_blocks = qc.gather(-1, (dc + rc).argmin(-1, keepdim=True)).squeeze(-1).to(torch.int8)
     rec_blocks = q_blocks.float() * best_steps.unsqueeze(-1)
     rec = rec_blocks.view(-1)[:N].view(H, W).to(torch.int32)
     q_plane = q_blocks.view(-1)[:N].view(H, W).to(torch.int8)
-    idx = best.to(torch.uint8)  # [M] 0-7
+    idx = best.to(torch.uint8)  # [M] 0-15
     idx_packed = _pack_4b(idx)
     return q_plane, idx_packed, rec
 
@@ -1334,19 +1457,21 @@ def quantize_pixel_wavelet_adaptive(
     G: int = 32,
     codebook: torch.Tensor | None = None,
     mode: str | None = None,
+    chroma420: bool | None = None,
 ) -> tuple[dict, tuple[int, int, int]]:
     """
     Tunable adaptive JPEG-XS wavelet: per-block G=32 RDO D+lamb*R with 4b codebook.
     Lower lamb/q_scale -> lower error (higher fidelity), higher -> higher compression.
     Presets: ultra/high/balanced/compress/ultra_comp (see WAVELET_ADAPTIVE_PRESETS).
-    CPU & GPU kernels: batched [3,H,W] DWT + per-plane vectorized RDO (offline) + Triton dequant + IDWT.
+    chroma420: 4:2:0 subsampled chroma (None = auto: 4:4:4 for ultra/high, 4:2:0 below).
 
     Args:
         q_scale: base deadzone scale (0.5-8.0, default 3.0). Smaller = finer.
         lamb: RDO tradeoff (0.1-50, default 5.0). Smaller = favor PSNR, larger = favor bits.
         G: block size (32 default, 16/64 also tunable but 32 is Pareto).
-        codebook: [C] float m values (default 8-entry [0.5,3.0] -> 4b).
+        codebook: [C] float m values (default 16-entry [0.5,3.0] -> 4b).
         mode: preset name overrides q_scale/lamb.
+        chroma420: subsample chroma 2x (None = auto by mode).
 
     Returns packed_meta with adaptive=True, plus orig_shape. Use dequantize_pixel_wavelet_adaptive.
     """
@@ -1354,6 +1479,8 @@ def quantize_pixel_wavelet_adaptive(
         if mode not in WAVELET_ADAPTIVE_PRESETS:
             raise ValueError(f"Unknown mode {mode}, choose from {list(WAVELET_ADAPTIVE_PRESETS)}")
         q_scale, lamb = WAVELET_ADAPTIVE_PRESETS[mode]
+    if chroma420 is None:
+        chroma420 = False if mode in ("ultra", "high") else True
     if codebook is None:
         codebook = ADAPTIVE_CODEBOOK
     codebook = codebook.to(torch.float32)
@@ -1369,15 +1496,32 @@ def quantize_pixel_wavelet_adaptive(
     if pad_h > 0 or pad_w > 0:
         t = F.pad(t.permute(2, 0, 1), (0, pad_w, 0, pad_h), mode='replicate').permute(1, 2, 0)
 
-    # Batched DWT on yuv [3,Hp,Wp]
+    # RCT -> luma full-res + chroma full (444) or half res (420)
     yuv = rct_forward(t)  # [Hp,Wp,3]
     yuv_b = yuv.permute(2, 0, 1).contiguous()  # [3,Hp,Wp]
-    LL1, LH1, HL1, HH1 = _dwt_53_2d_step_batched(yuv_b)
-    LL2, LH2, HL2, HH2 = _dwt_53_2d_step_batched(LL1)
-    LL3, LH3, HL3, HH3 = _dwt_53_2d_step_batched(LL2)
-    LL4, LH4, HL4, HH4 = _dwt_53_2d_step_batched(LL3)
+    Y = yuv_b[0:1]  # [1, Hp, Wp]
+    Cc = _downsample2(yuv_b[1:3]) if chroma420 else yuv_b[1:3]
 
-    # Per-level base_q per channel [3]
+    # Luma 4-level DWT; chroma 3-level (420) or 4-level (444) DWT
+    YL1, YLH1, YHL1, YHH1 = _dwt_53_2d_step_batched(Y)
+    YL2, YLH2, YHL2, YHH2 = _dwt_53_2d_step_batched(YL1)
+    YL3, YLH3, YHL3, YHH3 = _dwt_53_2d_step_batched(YL2)
+    YL4, YLH4, YHL4, YHH4 = _dwt_53_2d_step_batched(YL3)
+    if chroma420:
+        CL2, CLH2, CHL2, CHH2 = _dwt_53_2d_step_batched(Cc)
+        CL3, CLH3, CHL3, CHH3 = _dwt_53_2d_step_batched(CL2)
+        CL4, CLH4, CHL4, CHH4 = _dwt_53_2d_step_batched(CL3)
+    else:
+        CL1, CLH1, CHL1, CHH1 = _dwt_53_2d_step_batched(Cc)
+        CL2, CLH2, CHL2, CHH2 = _dwt_53_2d_step_batched(CL1)
+        CL3, CLH3, CHL3, CHH3 = _dwt_53_2d_step_batched(CL2)
+        CL4, CLH4, CHL4, CHH4 = _dwt_53_2d_step_batched(CL3)
+
+    # Per-level base_q per channel [3] (chroma at spatially equivalent level x1.8).
+    # NOTE: bases stay fine-grained (0.5/1/2/4); cross-level allocation is the
+    # RDO's job via SUBBAND_GAINS x RCT channel gains, not the base scale.
+    # (Static-path equal-slope rescaling must NOT leak in here: it would lift
+    # the finest available step and cap top-end fidelity.)
     dev = yuv_b.device
     def make_qs(scale, c_f_y=1.0, c_f_c=1.8):
         return torch.tensor([max(1, int(round(scale*c_f_y))), max(1, int(round(scale*c_f_c))), max(1, int(round(scale*c_f_c)))], device=dev)
@@ -1386,34 +1530,45 @@ def quantize_pixel_wavelet_adaptive(
     q_l2 = make_qs(q_scale*2.0)
     q_l1 = make_qs(q_scale*4.0)
 
-    # Prepare storage for adaptive planes
-    # We'll store per-level list of (q, idx_packed) for LH/HL/HH
-    # LL4 stays int16 lossless [3, H4, W4]
+    # Stack shared levels across channels (shapes match by spatial naming)
+    def stk(*planes):
+        return torch.cat(planes, dim=0)
+    LL4 = stk(YL4, CL4)  # [3, H4, W4]
+    LH4, HL4, HH4 = stk(YLH4, CLH4), stk(YHL4, CHL4), stk(YHH4, CHH4)
+    LH3, HL3, HH3 = stk(YLH3, CLH3), stk(YHL3, CHL3), stk(YHH3, CHH3)
+    LH2, HL2, HH2 = stk(YLH2, CLH2), stk(YHL2, CHL2), stk(YHH2, CHH2)
+    # L1 luma-only
     LL4_q = LL4.to(torch.int16)
 
-    planes = [
+    planes_y = [
+        (YLH4[0], q_l4, "LH4"), (YHL4[0], q_l4, "HL4"), (YHH4[0], q_l4*2, "HH4"),
+        (YLH3[0], q_l3, "LH3"), (YHL3[0], q_l3, "HL3"), (YHH3[0], q_l3*2, "HH3"),
+        (YLH2[0], q_l2, "LH2"), (YHL2[0], q_l2, "HL2"), (YHH2[0], q_l2*2, "HH2"),
+        (YLH1[0], q_l1, "LH1"), (YHL1[0], q_l1, "HL1"), (YHH1[0], q_l1*2, "HH1"),
+    ]
+    # Chroma planes share the stacked tensors; per-channel slice taken in loop.
+    # (stacked [3,...] with Y at [0]; chroma loop uses entries 1, 2)
+    planes_c = [
         (LH4, q_l4, "LH4"), (HL4, q_l4, "HL4"), (HH4, q_l4*2, "HH4"),
         (LH3, q_l3, "LH3"), (HL3, q_l3, "HL3"), (HH3, q_l3*2, "HH3"),
         (LH2, q_l2, "LH2"), (HL2, q_l2, "HL2"), (HH2, q_l2*2, "HH2"),
-        (LH1, q_l1, "LH1"), (HL1, q_l1, "HL1"), (HH1, q_l1*2, "HH1"),
     ]
+    if not chroma420:
+        # 4:4:4 chroma also gets L1 (full-res), stacked for uniform [c] indexing
+        LH1c, HL1c, HH1c = stk(YLH1, CLH1), stk(YHL1, CHL1), stk(YHH1, CHH1)
+        planes_c += [(LH1c, q_l1, "LH1"), (HL1c, q_l1, "HL1"), (HH1c, q_l1*2, "HH1")]
 
     adaptive_channels = []  # per channel dict
-    # For efficiency, process per-plane batched then split
-    # But _quant_adaptive_plane is per [H,W], so loop 12*3=36 calls. Acceptable for offline cache.
-    # For on-the-fly GPU, this is still <3ms encode (batched RDO is vectorized per plane).
+    # Luma: 12 planes RDO. Chroma: 9 (420) or 12 (444) planes RDO.
+    zero_hh = "HH2" if chroma420 else "HH1"  # finest chroma level
     for c in range(3):
         chan_dict = {'LL4': LL4_q[c]}
-        # Will fill per level
-        # Use index to map
-        idx = 0
-        for lvl, (coeff_all, base_q_all, name) in enumerate(planes):
-            coeff = coeff_all[c]  # [H,W]
-            bq = int(base_q_all[c].item())
-            lvl_name = name[2] if len(name)==3 else name  # e.g., L4 vs LH4? keep L4
-            # Determine level group: L4->planes 0-2, L3 3-5 etc.
-            # For HH1 chroma zero: if c>0 and name=="HH1", store zeros
-            if name == "HH1" and c > 0:
+        plist = planes_y if c == 0 else planes_c
+        for (coeff_all, base_q_all, name) in plist:
+            coeff = coeff_all if c == 0 else coeff_all[c]  # [H,W]
+            bq = int(base_q_all[0].item()) if c == 0 else int(base_q_all[c].item())
+            # Zero chroma HH at its finest level
+            if name == zero_hh and c > 0:
                 # Zero plane - store zeros and packed zero idx with correct M
                 q_zero = torch.zeros_like(coeff, dtype=torch.int8)
                 Hc, Wc = coeff.shape
@@ -1422,7 +1577,9 @@ def quantize_pixel_wavelet_adaptive(
                 idx_packed = torch.zeros((M + 1) // 2, dtype=torch.uint8, device=dev)
                 chan_dict[name] = (q_zero, idx_packed, bq)
                 continue
-            q_packed, idx_packed, rec = _quant_adaptive_plane(coeff, bq, codebook, lamb, G)
+            q_packed, idx_packed, rec = _quant_adaptive_plane(
+                coeff, bq, codebook, lamb, G,
+                gain=SUBBAND_GAINS[name] * (RCT_GAIN_Y if c == 0 else RCT_GAIN_C))
             chan_dict[name] = (q_packed, idx_packed, bq)
         adaptive_channels.append(chan_dict)
 
@@ -1441,6 +1598,7 @@ def quantize_pixel_wavelet_adaptive(
         'lamb': lamb,
         'codebook': codebook.cpu(),
         'mode': mode,
+        'chroma420': chroma420,
     }, (H, W, C)
 
 def dequantize_pixel_wavelet_adaptive(
@@ -1466,10 +1624,8 @@ def dequantize_pixel_wavelet_adaptive(
     codebook = packed_meta.get('codebook', ADAPTIVE_CODEBOOK).to(dev).float()
     channels = packed_meta['channels']
 
-    # Reconstruct per channel planes
-    # Need to build batched tensors for IDWT
-    # First dequant each plane
-    rec_planes = {}  # name -> [3, H, W] int32
+    # Reconstruct per channel planes (chroma dicts lack L1 keys under 4:2:0)
+    rec_planes = {}  # name -> [k, H, W] int32 (k=3 shared levels, k=1 luma L1)
     LL4_stack = torch.stack([ch['LL4'].to(dev).to(torch.int32) for ch in channels], dim=0)  # [3,H4,W4]
     rec_planes['LL4'] = LL4_stack
 
@@ -1479,28 +1635,28 @@ def dequantize_pixel_wavelet_adaptive(
         for c in range(3):
             ch = channels[c]
             if name not in ch:
-                # HH1 chroma zero case stored as (q, idx, bq) but we stored dummy
-                # Actually for HH1 c>0 we stored zeros
-                if name == "HH1" and c > 0:
-                    # need shape: HH1 is smallest? Get from LH1 shape
-                    # Use LH1 shape as reference
-                    ref = channels[0][f"LH1"][0]  # q
-                    rec_list.append(torch.zeros_like(ref, dtype=torch.int32))
-                    continue
-                else:
-                    raise KeyError(f"Missing {name} in channel {c}")
+                continue  # chroma has no L1
             q_plane, idx_packed, bq = ch[name]
             q_plane = q_plane.to(dev)
             idx_packed = idx_packed.to(dev)
             rec = _dequant_adaptive_plane(q_plane, idx_packed, bq, codebook, G)
             rec_list.append(rec)
-        rec_planes[name] = torch.stack(rec_list, dim=0)  # [3,H,W]
+        rec_planes[name] = torch.stack(rec_list, dim=0)
 
-    # 4-stage IDWT batched
-    rec_ll3 = _idwt_53_2d_step_batched(rec_planes['LL4'], rec_planes['LH4'], rec_planes['HL4'], rec_planes['HH4'])
-    rec_ll2 = _idwt_53_2d_step_batched(rec_ll3, rec_planes['LH3'], rec_planes['HL3'], rec_planes['HH3'])
-    rec_ll1 = _idwt_53_2d_step_batched(rec_ll2, rec_planes['LH2'], rec_planes['HL2'], rec_planes['HH2'])
-    rec_yuv_b = _idwt_53_2d_step_batched(rec_ll1, rec_planes['LH1'], rec_planes['HL1'], rec_planes['HH1'])
+    # 4:4:4 -> full chain; 4:2:0 -> luma 4-stage + chroma 3-stage + upsample
+    if not _chroma_is_subsampled(packed_meta):
+        rec_ll3 = _idwt_53_2d_step_batched(rec_planes['LL4'], rec_planes['LH4'], rec_planes['HL4'], rec_planes['HH4'])
+        rec_ll2 = _idwt_53_2d_step_batched(rec_ll3, rec_planes['LH3'], rec_planes['HL3'], rec_planes['HH3'])
+        rec_ll1 = _idwt_53_2d_step_batched(rec_ll2, rec_planes['LH2'], rec_planes['HL2'], rec_planes['HH2'])
+        rec_yuv_b = _idwt_53_2d_step_batched(rec_ll1, rec_planes['LH1'], rec_planes['HL1'], rec_planes['HH1'])
+    else:
+        rec_ll3 = _idwt_53_2d_step_batched(rec_planes['LL4'], rec_planes['LH4'], rec_planes['HL4'], rec_planes['HH4'])
+        rec_ll2_y = _idwt_53_2d_step_batched(rec_ll3[0:1], rec_planes['LH3'][0:1], rec_planes['HL3'][0:1], rec_planes['HH3'][0:1])
+        rec_ll2_c = _idwt_53_2d_step_batched(rec_ll3[1:3], rec_planes['LH3'][1:3], rec_planes['HL3'][1:3], rec_planes['HH3'][1:3])
+        rec_ll1_y = _idwt_53_2d_step_batched(rec_ll2_y, rec_planes['LH2'][0:1], rec_planes['HL2'][0:1], rec_planes['HH2'][0:1])
+        rec_c_half = _idwt_53_2d_step_batched(rec_ll2_c, rec_planes['LH2'][1:3], rec_planes['HL2'][1:3], rec_planes['HH2'][1:3])
+        rec_y = _idwt_53_2d_step_batched(rec_ll1_y, rec_planes['LH1'], rec_planes['HL1'], rec_planes['HH1'])
+        rec_yuv_b = torch.cat([rec_y, _upsample2(rec_c_half)], dim=0)
 
     rec_yuv = rec_yuv_b.permute(1, 2, 0)
     rec_rgb_full = rct_inverse(rec_yuv)
@@ -1510,4 +1666,240 @@ def dequantize_pixel_wavelet_adaptive(
         out_buffer.copy_(rec_rgb)
         return out_buffer
     return rec_rgb
+
+
+# =============================================================================
+# SPARSE BYTE-ALIGNED BITSTREAM (CPU reference pack/unpack for measurement)
+# -----------------------------------------------------------------------------
+# Per quantized int8 plane [h, w], row-major, blocked at G (default 32):
+#   mask  uint8 [M, 4]   bit i of block b = (elem b*G+i != 0), LSB first
+#   vals  int8  [nnz]    nonzero values in row-major order
+# LL4 stays raw int16; adaptive 4b idx planes stay as-is (already packed).
+# Unpack rebuilds the dense packed_meta schema, so every existing CPU/GPU
+# dequantizer works unchanged (proves the format plugs into the pipeline).
+# =============================================================================
+
+def sparse_pack_plane(
+    q_plane: torch.Tensor,
+    G: int = 32,
+) -> dict:
+    """Pack one int8 plane. Empty blocks cost 1 occ bit. Occupied blocks use
+    flat 32b masks or hierarchical nibble masks (8 presence bits + 4b per
+    nonempty nibble), whichever is smaller (hier wins iff <=5 of 8 nibbles
+    nonempty: 8+4k<=28 < 32). A mode bit per occupied block selects.
+
+    Returns dict(mask [Mf,4] flat masks, hflags [Mh] presence bytes,
+    hnib packed nonempty nibbles, mode [(Mo+7)//8] over occupied blocks,
+    occ [(M+7)//8], vals int8 [nnz], shape (h, w), M).
+    vals stay shared/in-order, so unpack needs no extra indexing.
+    """
+    if G != 32:
+        raise ValueError(f"sparse bitstream requires G=32, got {G}")
+    h, w = q_plane.shape
+    flat = q_plane.reshape(-1).to(torch.int8)
+    N = flat.numel()
+    pad = (G - N % G) % G
+    if pad:
+        flat = F.pad(flat, (0, pad))
+    blocks = flat.view(-1, G)
+    M = blocks.shape[0]
+    nz = blocks != 0  # [M, G] bool
+    w8 = (1 << torch.arange(8, device=blocks.device)).to(torch.uint8)
+    # occupancy: 1 bit per block, LSB first
+    occ = nz.any(-1).to(torch.uint8)  # [M]
+    occ_pad = (8 - M % 8) % 8
+    if occ_pad:
+        occ = F.pad(occ, (0, occ_pad))
+    occ_bytes = (occ.view(-1, 8) * w8).sum(-1).to(torch.uint8)
+    # masks + vals for occupied blocks only
+    occ_b = occ[:M].bool()
+    occ_blocks = blocks[occ_b]  # [Mo, G]
+    Mo = occ_blocks.shape[0]
+    # flat-vs-hier per occupied block (hier wins iff <=5 nonempty nibbles)
+    onz = occ_blocks != 0  # [Mo, G]
+    nib_any = onz.view(Mo, 8, 4).any(-1) if Mo else torch.zeros(0, 8, dtype=torch.bool)
+    k = nib_any.sum(-1)  # [Mo]
+    use_hier = k <= 5
+    mode_bits = use_hier.to(torch.uint8)
+    mp = (8 - Mo % 8) % 8
+    mode_bytes = ((F.pad(mode_bits, (0, mp)).view(-1, 8) * w8).sum(-1).to(torch.uint8)
+                  if Mo else torch.zeros(0, dtype=torch.uint8))
+    fb = occ_blocks[~use_hier]  # [Mf, G]
+    fbnz = (fb != 0).view(-1, 4, 8).to(torch.uint8) if fb.numel() else fb.view(0, 4, 8)
+    flat_masks = (fbnz * w8).sum(-1).to(torch.uint8) if fb.numel() else \
+        torch.zeros(0, 4, dtype=torch.uint8)
+    hb = occ_blocks[use_hier]  # [Mh, G]
+    if hb.numel():
+        hnib_any = (hb != 0).view(-1, 8, 4).any(-1)  # [Mh, 8]
+        hflags = (hnib_any.to(torch.uint8) * w8).sum(-1).to(torch.uint8)  # [Mh]
+        nib4 = ((hb != 0).view(-1, 8, 4).to(torch.uint8)
+                * torch.tensor([1, 2, 4, 8], device=blocks.device).to(torch.uint8)).sum(-1)
+        hnib_vals = nib4.reshape(-1)[hnib_any.reshape(-1)].to(torch.uint8)
+        hnib = _pack_4b(hnib_vals) if hnib_vals.numel() else torch.zeros(0, dtype=torch.uint8)
+    else:
+        hflags = torch.zeros(0, dtype=torch.uint8)
+        hnib = torch.zeros(0, dtype=torch.uint8)
+    vals = occ_blocks[onz].to(torch.int8)
+    return {"mask": flat_masks, "hflags": hflags, "hnib": hnib, "mode": mode_bytes,
+            "occ": occ_bytes, "vals": vals, "shape": (h, w), "M": M}
+
+
+def sparse_unpack_plane(
+    packed: dict,
+    G: int = 32,
+) -> torch.Tensor:
+    """Inverse of sparse_pack_plane -> int8 plane [h, w]."""
+    if G != 32:
+        raise ValueError(f"sparse bitstream requires G=32, got {G}")
+    mask, vals, occ = packed["mask"], packed["vals"], packed["occ"]
+    hflags, hnib, mode_b = packed["hflags"], packed["hnib"], packed["mode"]
+    h, w = tuple(packed["shape"])
+    M = int(packed["M"])
+    N = h * w
+    ar = torch.arange(8, device=occ.device)
+    w8 = (1 << ar).to(torch.uint8)
+    occ_bits = ((occ.unsqueeze(-1).to(torch.int16) >> ar) & 1).reshape(-1)[:M].bool()
+    Mo = int(occ_bits.sum().item())
+    mode = (((mode_b.unsqueeze(-1).to(torch.int16) >> ar) & 1).reshape(-1)[:Mo].bool()) \
+        if Mo else torch.zeros(0, dtype=torch.bool, device=occ.device)
+    # mode expanded to full block grid (flat decoding below is fully vectorized)
+    mode_full = torch.zeros(M, dtype=torch.bool, device=occ.device)
+    if Mo:
+        mode_full[occ_bits] = mode
+    flat_sel = occ_bits & ~mode_full
+    full_mask = torch.zeros((M, 4), dtype=torch.uint8, device=mask.device)
+    if flat_sel.any():
+        full_mask[flat_sel] = mask.to(torch.uint8)
+    hier_sel = torch.where(occ_bits & mode_full)[0]  # [Mh] block ids
+    Mh = hier_sel.numel()
+    if Mh:
+        # total hier nibbles = sum of presence popcounts
+        k = (((hflags.unsqueeze(-1).to(torch.int16) >> ar) & 1).sum(-1).to(torch.long))  # [Mh]
+        npop = int(k.sum().item())
+        hnib_flat = _unpack_4b(hnib, npop) if npop else \
+            torch.zeros(0, dtype=torch.uint8, device=occ.device)
+        # scatter nibbles into [Mh, 8] presence slots, then expand to mask bits
+        flagbits = (((hflags.unsqueeze(-1).to(torch.int16) >> ar) & 1).bool())  # [Mh,8]
+        brow = torch.repeat_interleave(torch.arange(Mh, device=occ.device), k)
+        slot = torch.arange(8, device=occ.device).expand(Mh, 8)[flagbits]
+        nibpat = torch.zeros((Mh, 8), dtype=torch.uint8, device=occ.device)
+        if npop:
+            nibpat[brow, slot] = hnib_flat.to(torch.uint8)
+        ar4 = torch.arange(4, device=occ.device)
+        hbits = (((nibpat.unsqueeze(-1).to(torch.int16) >> ar4) & 1)
+                 .reshape(Mh, 32).to(torch.uint8))  # [Mh,32]
+        full_mask[hier_sel] = (hbits.view(Mh, 4, 8) * w8).sum(-1).to(torch.uint8)
+    bits = ((full_mask.unsqueeze(-1).to(torch.int16) >> ar) & 1)
+    nz_full = bits.reshape(-1).bool()  # [M*G], pad region always zero
+    out = torch.zeros(M * G, dtype=torch.int8, device=mask.device)
+    out[nz_full] = vals.to(torch.int8)
+    return out[:N].view(h, w)
+
+
+def sparse_pack_meta(packed_meta: dict, G: int = 32) -> dict:
+    """Pack a static or adaptive wavelet packed_meta into a sparse bitstream dict."""
+    adaptive = bool(packed_meta.get("adaptive", False))
+    sparse_channels = []
+    for ch in packed_meta["channels"]:
+        entry: dict = {"LL4": ch["LL4"].to(torch.int16).cpu()}
+        if adaptive:
+            for name, v in ch.items():
+                if name == "LL4":
+                    continue
+                q_plane, idx_packed, bq = v
+                p = sparse_pack_plane(q_plane.cpu().to(torch.int8), G)
+                p["idx_packed"] = idx_packed.cpu()
+                p["bq"] = int(bq)
+                entry[name] = p
+        else:
+            for lvl in ("L4", "L3", "L2", "L1"):
+                if lvl not in ch:
+                    continue  # chroma has no L1 under 4:2:0
+                LH, HL, HH, q = ch[lvl]
+                planes = {}
+                for pname, plane in (("LH", LH), ("HL", HL), ("HH", HH)):
+                    planes[pname] = sparse_pack_plane(plane.cpu().to(torch.int8), G)
+                entry[lvl] = {"planes": planes, "q": int(q)}
+        sparse_channels.append(entry)
+    out = {
+        "adaptive": adaptive,
+        "G": G,
+        "orig_shape": packed_meta["orig_shape"],
+        "pad_h": packed_meta["pad_h"],
+        "pad_w": packed_meta["pad_w"],
+        "channels": sparse_channels,
+    }
+    if adaptive:
+        out["codebook"] = packed_meta["codebook"].cpu()
+        out["q_scale"] = packed_meta.get("q_scale")
+        out["lamb"] = packed_meta.get("lamb")
+        out["mode"] = packed_meta.get("mode")
+    return out
+
+
+def sparse_unpack_meta(sparse: dict) -> dict:
+    """Rebuild dense packed_meta from a sparse dict (schema the dequantizers expect)."""
+    G = sparse.get("G", 32)
+    dev = torch.device("cpu")
+    channels = []
+    if sparse["adaptive"]:
+        for ch in sparse["channels"]:
+            d = {"LL4": ch["LL4"].to(dev)}
+            for name, p in ch.items():
+                if name == "LL4":
+                    continue
+                q = sparse_unpack_plane(p, G)
+                d[name] = (q, p["idx_packed"].to(dev), int(p["bq"]))
+            channels.append(d)
+    else:
+        for ch in sparse["channels"]:
+            d = {"LL4": ch["LL4"].to(dev)}
+            for lvl in ("L4", "L3", "L2", "L1"):
+                if lvl not in ch:
+                    continue  # chroma has no L1 under 4:2:0
+                e = ch[lvl]
+                planes = tuple(
+                    sparse_unpack_plane(e["planes"][pn], G)
+                    for pn in ("LH", "HL", "HH")
+                )
+                d[lvl] = planes + (int(e["q"]),)
+            channels.append(d)
+    out = {
+        "adaptive": sparse["adaptive"],
+        "orig_shape": tuple(sparse["orig_shape"]),
+        "pad_h": int(sparse["pad_h"]),
+        "pad_w": int(sparse["pad_w"]),
+        "channels": channels,
+    }
+    if sparse["adaptive"]:
+        out["G"] = G
+        out["codebook"] = sparse["codebook"]
+        out["q_scale"] = sparse.get("q_scale")
+        out["lamb"] = sparse.get("lamb")
+        out["mode"] = sparse.get("mode")
+    return out
+
+
+def _plane_nbytes(p: dict) -> int:
+    return (p["mask"].nelement() + p["hflags"].nelement() + p["hnib"].nelement()
+            + p["mode"].nelement() + p["vals"].nelement() + p["occ"].nelement())
+
+
+def sparse_nbytes(sparse: dict) -> int:
+    """Actual stored bytes of a sparse dict (tensors only; header is tens of bytes)."""
+    total = 0
+    for ch in sparse["channels"]:
+        total += ch["LL4"].nelement() * 2
+        if sparse["adaptive"]:
+            for name, p in ch.items():
+                if name == "LL4":
+                    continue
+                total += _plane_nbytes(p) + p["idx_packed"].nelement()
+        else:
+            for lvl in ("L4", "L3", "L2", "L1"):
+                if lvl not in ch:
+                    continue  # chroma has no L1 under 4:2:0
+                for pn in ("LH", "HL", "HH"):
+                    total += _plane_nbytes(ch[lvl]["planes"][pn])
+    return total
 

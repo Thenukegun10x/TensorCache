@@ -437,6 +437,7 @@ if HAS_TRITON:
         out_val = tl.where(is_even_row, even, odd)
         tl.store(out_ptr + offs * W + col, out_val, mask=mask & col_mask)
 
+
     # Autotune configs for wavelet (row/col are memory bound, small BLOCK is fine)
     _wavelet_row_configs = []
     _wavelet_col_configs = []
@@ -476,11 +477,11 @@ if HAS_TRITON:
         d_r = _launch_idwt_col(HL, HH)
         return _launch_idwt_row(s_r, d_r)
 
-    def quantize_fused_wavelet8x_gpu(img: torch.Tensor, q_scale: float = 3.0) -> Tuple[dict, Tuple[int, int, int]]:
+    def quantize_fused_wavelet8x_gpu(img: torch.Tensor, q_scale: float = 3.0, chroma420: bool = True) -> Tuple[dict, Tuple[int, int, int]]:
         # Quantize is already vectorized torch (fast enough, <1ms); keep PyTorch path to avoid extra kernel complexity
         from .codec import quantize_pixel_wavelet8x
         # Ensure on GPU if possible, but keep logic identical for bit-exactness
-        return quantize_pixel_wavelet8x(img, q_scale=q_scale)
+        return quantize_pixel_wavelet8x(img, q_scale=q_scale, chroma420=chroma420)
 
     def dequantize_fused_wavelet8x_gpu(packed_meta: dict, device: str | torch.device = "cuda:0", out_buffer: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -493,39 +494,67 @@ if HAS_TRITON:
         H, W, C = packed_meta['orig_shape']
         # Fast path: use batched stacks then Triton per-plane synthesis
         try:
-            # Build dequantized stacks as int32 on device
+            from .codec import _dequant_static_plane, _upsample2, _chroma_is_subsampled
+            sub = _chroma_is_subsampled(packed_meta)
+            # Build dequantized stacks as int32 on device (deadzone-aware centroids)
+            # L4/L3/L2 stack [3, ...] (Y + subsampled C); L1 is luma-only [1, ...]
             LL4 = torch.stack([c['LL4'].to(dev).to(torch.int32) for c in channels_data], dim=0)  # [3, H4, W4]
             q4 = torch.tensor([c['L4'][3] for c in channels_data], device=dev, dtype=torch.int32).view(3, 1, 1)
-            LH4 = torch.stack([c['L4'][0] for c in channels_data], dim=0).to(dev).to(torch.int32) * q4
-            HL4 = torch.stack([c['L4'][1] for c in channels_data], dim=0).to(dev).to(torch.int32) * q4
-            HH4 = torch.stack([c['L4'][2] for c in channels_data], dim=0).to(dev).to(torch.int32) * (q4 * 2)
+            LH4 = _dequant_static_plane(torch.stack([c['L4'][0] for c in channels_data], dim=0).to(dev), q4)
+            HL4 = _dequant_static_plane(torch.stack([c['L4'][1] for c in channels_data], dim=0).to(dev), q4)
+            HH4 = _dequant_static_plane(torch.stack([c['L4'][2] for c in channels_data], dim=0).to(dev), q4 * 2)
             q3 = torch.tensor([c['L3'][3] for c in channels_data], device=dev, dtype=torch.int32).view(3, 1, 1)
-            LH3 = torch.stack([c['L3'][0] for c in channels_data], dim=0).to(dev).to(torch.int32) * q3
-            HL3 = torch.stack([c['L3'][1] for c in channels_data], dim=0).to(dev).to(torch.int32) * q3
-            HH3 = torch.stack([c['L3'][2] for c in channels_data], dim=0).to(dev).to(torch.int32) * (q3 * 2)
+            LH3 = _dequant_static_plane(torch.stack([c['L3'][0] for c in channels_data], dim=0).to(dev), q3)
+            HL3 = _dequant_static_plane(torch.stack([c['L3'][1] for c in channels_data], dim=0).to(dev), q3)
+            HH3 = _dequant_static_plane(torch.stack([c['L3'][2] for c in channels_data], dim=0).to(dev), q3 * 2)
             q2 = torch.tensor([c['L2'][3] for c in channels_data], device=dev, dtype=torch.int32).view(3, 1, 1)
-            LH2 = torch.stack([c['L2'][0] for c in channels_data], dim=0).to(dev).to(torch.int32) * q2
-            HL2 = torch.stack([c['L2'][1] for c in channels_data], dim=0).to(dev).to(torch.int32) * q2
-            HH2 = torch.stack([c['L2'][2] for c in channels_data], dim=0).to(dev).to(torch.int32) * (q2 * 2)
-            q1 = torch.tensor([c['L1'][3] for c in channels_data], device=dev, dtype=torch.int32).view(3, 1, 1)
-            LH1 = torch.stack([c['L1'][0] for c in channels_data], dim=0).to(dev).to(torch.int32) * q1
-            HL1 = torch.stack([c['L1'][1] for c in channels_data], dim=0).to(dev).to(torch.int32) * q1
-            HH1 = torch.stack([c['L1'][2] for c in channels_data], dim=0).to(dev).to(torch.int32) * (q1 * 2)
+            LH2 = _dequant_static_plane(torch.stack([c['L2'][0] for c in channels_data], dim=0).to(dev), q2)
+            HL2 = _dequant_static_plane(torch.stack([c['L2'][1] for c in channels_data], dim=0).to(dev), q2)
+            HH2 = _dequant_static_plane(torch.stack([c['L2'][2] for c in channels_data], dim=0).to(dev), q2 * 2)
+            yc = channels_data[0]
+            if sub:
+                q1 = torch.tensor([yc['L1'][3]], device=dev, dtype=torch.int32).view(1, 1, 1)
+                LH1 = _dequant_static_plane(torch.stack([yc['L1'][0]], dim=0).to(dev), q1)
+                HL1 = _dequant_static_plane(torch.stack([yc['L1'][1]], dim=0).to(dev), q1)
+                HH1 = _dequant_static_plane(torch.stack([yc['L1'][2]], dim=0).to(dev), q1 * 2)
+            else:
+                q1 = torch.tensor([c['L1'][3] for c in channels_data], device=dev, dtype=torch.int32).view(3, 1, 1)
+                LH1 = _dequant_static_plane(torch.stack([c['L1'][0] for c in channels_data], dim=0).to(dev), q1)
+                HL1 = _dequant_static_plane(torch.stack([c['L1'][1] for c in channels_data], dim=0).to(dev), q1)
+                HH1 = _dequant_static_plane(torch.stack([c['L1'][2] for c in channels_data], dim=0).to(dev), q1 * 2)
 
-            # 4-stage synthesis with Triton per-plane (B=3 loop, still 3x fewer than per-channel Python)
-            # Level 4 -> 3
-            rec_ll3 = torch.empty((3, LL4.shape[1]*2, LL4.shape[2]*2), dtype=torch.int32, device=dev)
-            for b in range(3):
-                rec_ll3[b] = _launch_idwt_2d(LL4[b], LH4[b], HL4[b], HH4[b])
-            rec_ll2 = torch.empty((3, rec_ll3.shape[1]*2, rec_ll3.shape[2]*2), dtype=torch.int32, device=dev)
-            for b in range(3):
-                rec_ll2[b] = _launch_idwt_2d(rec_ll3[b], LH3[b], HL3[b], HH3[b])
-            rec_ll1 = torch.empty((3, rec_ll2.shape[1]*2, rec_ll2.shape[2]*2), dtype=torch.int32, device=dev)
-            for b in range(3):
-                rec_ll1[b] = _launch_idwt_2d(rec_ll2[b], LH2[b], HL2[b], HH2[b])
-            rec_yuv_planes = torch.empty((3, rec_ll1.shape[1]*2, rec_ll1.shape[2]*2), dtype=torch.int32, device=dev)
-            for b in range(3):
-                rec_yuv_planes[b] = _launch_idwt_2d(rec_ll1[b], LH1[b], HL1[b], HH1[b])
+            if not sub:
+                # 4:4:4 full 4-stage chain on [3, ...]
+                rec_ll3 = torch.empty((3, LL4.shape[1]*2, LL4.shape[2]*2), dtype=torch.int32, device=dev)
+                for b in range(3):
+                    rec_ll3[b] = _launch_idwt_2d(LL4[b], LH4[b], HL4[b], HH4[b])
+                rec_ll2 = torch.empty((3, rec_ll3.shape[1]*2, rec_ll3.shape[2]*2), dtype=torch.int32, device=dev)
+                for b in range(3):
+                    rec_ll2[b] = _launch_idwt_2d(rec_ll3[b], LH3[b], HL3[b], HH3[b])
+                rec_ll1 = torch.empty((3, rec_ll2.shape[1]*2, rec_ll2.shape[2]*2), dtype=torch.int32, device=dev)
+                for b in range(3):
+                    rec_ll1[b] = _launch_idwt_2d(rec_ll2[b], LH2[b], HL2[b], HH2[b])
+                rec_yuv_planes = torch.empty((3, rec_ll1.shape[1]*2, rec_ll1.shape[2]*2), dtype=torch.int32, device=dev)
+                for b in range(3):
+                    rec_yuv_planes[b] = _launch_idwt_2d(rec_ll1[b], LH1[b], HL1[b], HH1[b])
+            else:
+                # Luma 4-stage chain + chroma 3-stage chain, then 2x upsample
+                rec_ll3 = torch.empty((3, LL4.shape[1]*2, LL4.shape[2]*2), dtype=torch.int32, device=dev)
+                for b in range(3):
+                    rec_ll3[b] = _launch_idwt_2d(LL4[b], LH4[b], HL4[b], HH4[b])
+                rec_ll2_y = torch.empty((1, rec_ll3.shape[1]*2, rec_ll3.shape[2]*2), dtype=torch.int32, device=dev)
+                rec_ll2_y[0] = _launch_idwt_2d(rec_ll3[0], LH3[0], HL3[0], HH3[0])
+                rec_ll2_c = torch.empty((2, rec_ll3.shape[1]*2, rec_ll3.shape[2]*2), dtype=torch.int32, device=dev)
+                for b in (1, 2):
+                    rec_ll2_c[b-1] = _launch_idwt_2d(rec_ll3[b], LH3[b], HL3[b], HH3[b])
+                rec_ll1_y = torch.empty((1, rec_ll2_y.shape[1]*2, rec_ll2_y.shape[2]*2), dtype=torch.int32, device=dev)
+                rec_ll1_y[0] = _launch_idwt_2d(rec_ll2_y[0], LH2[0], HL2[0], HH2[0])
+                rec_c_half = torch.empty((2, rec_ll2_c.shape[1]*2, rec_ll2_c.shape[2]*2), dtype=torch.int32, device=dev)
+                for b in range(2):
+                    rec_c_half[b] = _launch_idwt_2d(rec_ll2_c[b], LH2[b+1], HL2[b+1], HH2[b+1])
+                rec_y = torch.empty((1, rec_ll1_y.shape[1]*2, rec_ll1_y.shape[2]*2), dtype=torch.int32, device=dev)
+                rec_y[0] = _launch_idwt_2d(rec_ll1_y[0], LH1[0], HL1[0], HH1[0])
+                rec_yuv_planes = torch.cat([rec_y, _upsample2(rec_c_half)], dim=0)
 
             # RCT inverse fused
             Hp, Wp = rec_yuv_planes.shape[1], rec_yuv_planes.shape[2]
@@ -577,8 +606,8 @@ if HAS_TRITON:
         is_odd = (block_id & 1) != 0
         packed = tl.load(idx_packed_ptr + byte_idx, mask=mask, other=0).to(tl.int32)
         idx = tl.where(is_odd, (packed >> 4) & 0xF, packed & 0xF).to(tl.int32)
-        # clamp idx to codebook size (8)
-        idx = tl.where(idx >= 8, 0, idx)
+        # clamp idx to codebook size (16)
+        idx = tl.where(idx >= 16, 0, idx)
         step_scale = tl.load(codebook_ptr + idx, mask=mask, other=1.0).to(tl.float32)
         step = base_q * step_scale
         out = (q * step).to(tl.int32)
@@ -602,9 +631,10 @@ if HAS_TRITON:
         lamb: float = 5.0,
         G: int = 32,
         mode: str | None = None,
+        chroma420: bool | None = None,
     ) -> tuple[dict, tuple[int, int, int]]:
         from .codec import quantize_pixel_wavelet_adaptive
-        return quantize_pixel_wavelet_adaptive(img, q_scale=q_scale, lamb=lamb, G=G, mode=mode)
+        return quantize_pixel_wavelet_adaptive(img, q_scale=q_scale, lamb=lamb, G=G, mode=mode, chroma420=chroma420)
 
     def dequantize_fused_wavelet_adaptive_gpu(
         packed_meta: dict,
@@ -614,9 +644,11 @@ if HAS_TRITON:
         dev = torch.device(device)
         H, W, C = packed_meta['orig_shape']
         G = packed_meta.get('G', 32)
-        codebook = packed_meta.get('codebook', torch.tensor([0.5,0.75,1.0,1.25,1.5,2.0,2.5,3.0], dtype=torch.float32)).to(dev).float()
+        from .codec import ADAPTIVE_CODEBOOK
+        codebook = packed_meta.get('codebook', ADAPTIVE_CODEBOOK).to(dev).float()
         channels = packed_meta['channels']
         # Build rec planes via Triton adaptive dequant + Triton IDWT
+        # L4/L3/L2 stack [3, ...] (Y + subsampled C); L1 is luma-only [1, ...]
         LL4 = torch.stack([ch['LL4'].to(dev).to(torch.int32) for ch in channels], dim=0)
         # For each plane, Triton dequant
         plane_names = ["LH4","HL4","HH4","LH3","HL3","HH3","LH2","HL2","HH2","LH1","HL1","HH1"]
@@ -627,31 +659,45 @@ if HAS_TRITON:
             for c in range(3):
                 ch = channels[c]
                 if name not in ch:
-                    if name == "HH1" and c > 0:
-                        # zero plane
-                        ref = channels[0]["LH1"][0]
-                        rec_list.append(torch.zeros_like(ref, dtype=torch.int32, device=dev))
-                        continue
-                    raise KeyError(name)
+                    continue  # chroma has no L1 under 4:2:0
                 q_plane, idx_packed, bq = ch[name]
                 q_plane = q_plane.to(dev)
                 idx_packed = idx_packed.to(dev)
                 rec = _launch_wavelet_adaptive_dequant(q_plane, idx_packed, bq, codebook, G)
                 rec_list.append(rec)
             rec_planes[name] = torch.stack(rec_list, dim=0)
-        # 4-stage IDWT with Triton per-plane
-        rec_ll3 = torch.empty((3, LL4.shape[1]*2, LL4.shape[2]*2), dtype=torch.int32, device=dev)
-        for b in range(3):
-            rec_ll3[b] = _launch_idwt_2d(LL4[b], rec_planes['LH4'][b], rec_planes['HL4'][b], rec_planes['HH4'][b])
-        rec_ll2 = torch.empty((3, rec_ll3.shape[1]*2, rec_ll3.shape[2]*2), dtype=torch.int32, device=dev)
-        for b in range(3):
-            rec_ll2[b] = _launch_idwt_2d(rec_ll3[b], rec_planes['LH3'][b], rec_planes['HL3'][b], rec_planes['HH3'][b])
-        rec_ll1 = torch.empty((3, rec_ll2.shape[1]*2, rec_ll2.shape[2]*2), dtype=torch.int32, device=dev)
-        for b in range(3):
-            rec_ll1[b] = _launch_idwt_2d(rec_ll2[b], rec_planes['LH2'][b], rec_planes['HL2'][b], rec_planes['HH2'][b])
-        rec_yuv_planes = torch.empty((3, rec_ll1.shape[1]*2, rec_ll1.shape[2]*2), dtype=torch.int32, device=dev)
-        for b in range(3):
-            rec_yuv_planes[b] = _launch_idwt_2d(rec_ll1[b], rec_planes['LH1'][b], rec_planes['HL1'][b], rec_planes['HH1'][b])
+        # 4:4:4 -> full chain; 4:2:0 -> luma 4-stage + chroma 3-stage + upsample
+        from .codec import _upsample2, _chroma_is_subsampled
+        if not _chroma_is_subsampled(packed_meta):
+            rec_ll3 = torch.empty((3, LL4.shape[1]*2, LL4.shape[2]*2), dtype=torch.int32, device=dev)
+            for b in range(3):
+                rec_ll3[b] = _launch_idwt_2d(LL4[b], rec_planes['LH4'][b], rec_planes['HL4'][b], rec_planes['HH4'][b])
+            rec_ll2 = torch.empty((3, rec_ll3.shape[1]*2, rec_ll3.shape[2]*2), dtype=torch.int32, device=dev)
+            for b in range(3):
+                rec_ll2[b] = _launch_idwt_2d(rec_ll3[b], rec_planes['LH3'][b], rec_planes['HL3'][b], rec_planes['HH3'][b])
+            rec_ll1 = torch.empty((3, rec_ll2.shape[1]*2, rec_ll2.shape[2]*2), dtype=torch.int32, device=dev)
+            for b in range(3):
+                rec_ll1[b] = _launch_idwt_2d(rec_ll2[b], rec_planes['LH2'][b], rec_planes['HL2'][b], rec_planes['HH2'][b])
+            rec_yuv_planes = torch.empty((3, rec_ll1.shape[1]*2, rec_ll1.shape[2]*2), dtype=torch.int32, device=dev)
+            for b in range(3):
+                rec_yuv_planes[b] = _launch_idwt_2d(rec_ll1[b], rec_planes['LH1'][b], rec_planes['HL1'][b], rec_planes['HH1'][b])
+        else:
+            rec_ll3 = torch.empty((3, LL4.shape[1]*2, LL4.shape[2]*2), dtype=torch.int32, device=dev)
+            for b in range(3):
+                rec_ll3[b] = _launch_idwt_2d(LL4[b], rec_planes['LH4'][b], rec_planes['HL4'][b], rec_planes['HH4'][b])
+            rec_ll2_y = torch.empty((1, rec_ll3.shape[1]*2, rec_ll3.shape[2]*2), dtype=torch.int32, device=dev)
+            rec_ll2_y[0] = _launch_idwt_2d(rec_ll3[0], rec_planes['LH3'][0], rec_planes['HL3'][0], rec_planes['HH3'][0])
+            rec_ll2_c = torch.empty((2, rec_ll3.shape[1]*2, rec_ll3.shape[2]*2), dtype=torch.int32, device=dev)
+            for b in (1, 2):
+                rec_ll2_c[b-1] = _launch_idwt_2d(rec_ll3[b], rec_planes['LH3'][b], rec_planes['HL3'][b], rec_planes['HH3'][b])
+            rec_ll1_y = torch.empty((1, rec_ll2_y.shape[1]*2, rec_ll2_y.shape[2]*2), dtype=torch.int32, device=dev)
+            rec_ll1_y[0] = _launch_idwt_2d(rec_ll2_y[0], rec_planes['LH2'][0], rec_planes['HL2'][0], rec_planes['HH2'][0])
+            rec_c_half = torch.empty((2, rec_ll2_c.shape[1]*2, rec_ll2_c.shape[2]*2), dtype=torch.int32, device=dev)
+            for b in range(2):
+                rec_c_half[b] = _launch_idwt_2d(rec_ll2_c[b], rec_planes['LH2'][b+1], rec_planes['HL2'][b+1], rec_planes['HH2'][b+1])
+            rec_y = torch.empty((1, rec_ll1_y.shape[1]*2, rec_ll1_y.shape[2]*2), dtype=torch.int32, device=dev)
+            rec_y[0] = _launch_idwt_2d(rec_ll1_y[0], rec_planes['LH1'][0], rec_planes['HL1'][0], rec_planes['HH1'][0])
+            rec_yuv_planes = torch.cat([rec_y, _upsample2(rec_c_half)], dim=0)
         # RCT
         Hp, Wp = rec_yuv_planes.shape[1], rec_yuv_planes.shape[2]
         n_pix = Hp * Wp
@@ -832,34 +878,25 @@ else:
         return quantize_pixel_wavelet8x(img, q_scale=q_scale)
 
     def dequantize_fused_wavelet8x_gpu(packed_meta: dict, device: str | torch.device = "cpu", out_buffer: Optional[torch.Tensor] = None):
-        # CPU fallback without Triton dispatch loop - use batched PyTorch directly to avoid recursion
+        # CPU fallback without Triton dispatch loop - shared batched helpers (luma 4-stage + chroma 3-stage)
         dev = torch.device(device)
         H, W, C = packed_meta['orig_shape']
-        # Batched dequant stacks
-        channels_data = packed_meta['channels']
-        LL4 = torch.stack([c['LL4'].to(dev).to(torch.int32) for c in channels_data], dim=0)
-        q4 = torch.tensor([c['L4'][3] for c in channels_data], device=dev, dtype=torch.int32).view(3, 1, 1)
-        LH4 = torch.stack([c['L4'][0] for c in channels_data], dim=0).to(dev).to(torch.int32) * q4
-        HL4 = torch.stack([c['L4'][1] for c in channels_data], dim=0).to(dev).to(torch.int32) * q4
-        HH4 = torch.stack([c['L4'][2] for c in channels_data], dim=0).to(dev).to(torch.int32) * (q4 * 2)
-        q3 = torch.tensor([c['L3'][3] for c in channels_data], device=dev, dtype=torch.int32).view(3, 1, 1)
-        LH3 = torch.stack([c['L3'][0] for c in channels_data], dim=0).to(dev).to(torch.int32) * q3
-        HL3 = torch.stack([c['L3'][1] for c in channels_data], dim=0).to(dev).to(torch.int32) * q3
-        HH3 = torch.stack([c['L3'][2] for c in channels_data], dim=0).to(dev).to(torch.int32) * (q3 * 2)
-        q2 = torch.tensor([c['L2'][3] for c in channels_data], device=dev, dtype=torch.int32).view(3, 1, 1)
-        LH2 = torch.stack([c['L2'][0] for c in channels_data], dim=0).to(dev).to(torch.int32) * q2
-        HL2 = torch.stack([c['L2'][1] for c in channels_data], dim=0).to(dev).to(torch.int32) * q2
-        HH2 = torch.stack([c['L2'][2] for c in channels_data], dim=0).to(dev).to(torch.int32) * (q2 * 2)
-        q1 = torch.tensor([c['L1'][3] for c in channels_data], device=dev, dtype=torch.int32).view(3, 1, 1)
-        LH1 = torch.stack([c['L1'][0] for c in channels_data], dim=0).to(dev).to(torch.int32) * q1
-        HL1 = torch.stack([c['L1'][1] for c in channels_data], dim=0).to(dev).to(torch.int32) * q1
-        HH1 = torch.stack([c['L1'][2] for c in channels_data], dim=0).to(dev).to(torch.int32) * (q1 * 2)
-        # Batched synthesis using PyTorch vectorized lifting (3x fewer launches)
-        from .codec import _idwt_53_2d_step_batched, rct_inverse
-        rec_ll3 = _idwt_53_2d_step_batched(LL4, LH4, HL4, HH4)
-        rec_ll2 = _idwt_53_2d_step_batched(rec_ll3, LH3, HL3, HH3)
-        rec_ll1 = _idwt_53_2d_step_batched(rec_ll2, LH2, HL2, HH2)
-        rec_yuv_batched = _idwt_53_2d_step_batched(rec_ll1, LH1, HL1, HH1)
+        from .codec import (_wavelet_batched_stacks, _idwt_53_2d_step_batched,
+                            _upsample2, _chroma_is_subsampled, rct_inverse)
+        LL4, (LH4, HL4, HH4), (LH3, HL3, HH3), (LH2, HL2, HH2), (LH1, HL1, HH1) = _wavelet_batched_stacks(packed_meta, dev)
+        if not _chroma_is_subsampled(packed_meta):
+            rec_ll3 = _idwt_53_2d_step_batched(LL4, LH4, HL4, HH4)
+            rec_ll2 = _idwt_53_2d_step_batched(rec_ll3, LH3, HL3, HH3)
+            rec_ll1 = _idwt_53_2d_step_batched(rec_ll2, LH2, HL2, HH2)
+            rec_yuv_batched = _idwt_53_2d_step_batched(rec_ll1, LH1, HL1, HH1)
+        else:
+            rec_ll3 = _idwt_53_2d_step_batched(LL4, LH4, HL4, HH4)
+            rec_ll2_y = _idwt_53_2d_step_batched(rec_ll3[0:1], LH3[0:1], HL3[0:1], HH3[0:1])
+            rec_ll2_c = _idwt_53_2d_step_batched(rec_ll3[1:3], LH3[1:3], HL3[1:3], HH3[1:3])
+            rec_ll1_y = _idwt_53_2d_step_batched(rec_ll2_y, LH2[0:1], HL2[0:1], HH2[0:1])
+            rec_c_half = _idwt_53_2d_step_batched(rec_ll2_c, LH2[1:3], HL2[1:3], HH2[1:3])
+            rec_y = _idwt_53_2d_step_batched(rec_ll1_y, LH1, HL1, HH1)
+            rec_yuv_batched = torch.cat([rec_y, _upsample2(rec_c_half)], dim=0)
         rec_yuv = rec_yuv_batched.permute(1, 2, 0)
         rec_rgb_full = rct_inverse(rec_yuv)
         rec_rgb = rec_rgb_full[:H, :W, :]

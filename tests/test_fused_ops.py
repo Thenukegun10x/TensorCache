@@ -25,6 +25,19 @@ from tensorcache.codec import (
 )
 
 
+def _natural_test_img(H=64, W=64, seed=42, device="cpu"):
+    """Detailed luma + smooth chroma (4:2:0-safe; white RGB noise aliases)."""
+    torch.manual_seed(seed)
+    raw = torch.randint(0, 256, (H, W), dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0)
+    lum = torch.nn.functional.avg_pool2d(raw, kernel_size=3, stride=1, padding=1).squeeze()
+    yy, xx = torch.meshgrid(torch.linspace(0, 1, H, device=device),
+                            torch.linspace(0, 1, W, device=device), indexing="ij")
+    tint_r = 24 * torch.sin(2 * math.pi * yy) * torch.cos(2 * math.pi * xx)
+    tint_g = 20 * torch.cos(2 * math.pi * (xx + yy))
+    tint_b = -18 * torch.sin(2 * math.pi * (xx - yy))
+    return torch.stack([lum + tint_r, lum + tint_g, lum + tint_b], dim=-1).clamp(0, 255).byte()
+
+
 def _is_functional_gpu() -> bool:
     if not torch.cuda.is_available() or not HAS_TRITON:
         return False
@@ -123,8 +136,7 @@ def test_fused_dequant_linear():
 def test_fused_wavelet8x_gpu():
     device = "cuda:0"
     H, W, C = 64, 64, 3
-    raw = torch.randint(0, 256, (H, W, C), dtype=torch.float32, device=device).permute(2, 0, 1).unsqueeze(0)
-    img = torch.nn.functional.avg_pool2d(raw, kernel_size=3, stride=1, padding=1).squeeze(0).permute(1, 2, 0).byte()
+    img = _natural_test_img(H, W, device=device)
     
     packed_meta, shape = quantize_fused_wavelet8x_gpu(img, q_scale=1.0)
     rec = dequantize_fused_wavelet8x_gpu(packed_meta, device=device)
