@@ -17,6 +17,8 @@ build/
 *.tar
 *.zip
 data/
+# Small test fixtures (not datasets): keep tests/data trackable despite data/
+!tests/data/
 *_int8.bin
 *_scales.bin
 *_zp.bin
