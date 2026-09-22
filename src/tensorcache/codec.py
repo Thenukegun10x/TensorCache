@@ -981,7 +981,7 @@ class BlockwiseInt8Codec:
 
 
 # =============================================================================
-# 8x GPU WAVELET CODEC (JPEG-XS Style CDF 5/3 Lifting + RCT)
+# 8x GPU WAVELET CODEC (CDF 5/3 Lifting + RCT — TensorCache's own "XS" codec)
 # =============================================================================
 
 def rct_forward(rgb: torch.Tensor) -> torch.Tensor:
@@ -1086,7 +1086,7 @@ def quantize_pixel_wavelet8x(
     chroma420: bool = True,
 ) -> Tuple[dict, Tuple[int, int, int]]:
     """
-    Quantize an RGB image tensor or array using 4-Level Dyadic Wavelet Lifting (JPEG-XS Style).
+    Quantize an RGB image tensor or array using 4-Level Dyadic Wavelet Lifting (CDF 5/3).
     chroma420=True (default): luma 4 DWT levels at full res, chroma 3 levels
       at half res (planes named by spatial equivalence; only L1 is luma-only).
     chroma420=False: full-res 4:4:4 chroma (all 3 channels have L1).
@@ -1461,7 +1461,7 @@ def quantize_pixel_wavelet_adaptive(
     chroma420: bool | None = None,
 ) -> tuple[dict, tuple[int, int, int]]:
     """
-    Tunable adaptive JPEG-XS wavelet: per-block G=32 RDO D+lamb*R with 4b codebook.
+    Tunable adaptive wavelet (XS): per-block G=32 RDO D+lamb*R with 4b codebook.
     Lower lamb/q_scale -> lower error (higher fidelity), higher -> higher compression.
     Presets: ultra/high/balanced/compress/ultra_comp (see WAVELET_ADAPTIVE_PRESETS).
     chroma420: 4:2:0 subsampled chroma (None = auto: 4:4:4 for ultra/high, 4:2:0 below).

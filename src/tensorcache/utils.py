@@ -175,7 +175,7 @@ Presets G32: fast (16,0.95-1.05) 6.9ms 0.49%, balanced (32,0.95-1.05) 13ms 0.478
 Storage: amo 1.09375 B/elem 1.83x vs BF16 (+0.03 vs sym 1.0625), dequant 0.06ms 5.4M
 G16 0.39% 1.1875B 1.68x for <0.4% needs.
 
-XS wavelet image cache (JPEG-XS style 5/3 + RCT + 4:2:0 + RDO, GPU decode):
+XS wavelet image cache (own 5/3 + RCT + 4:2:0 + RDO codec, GPU decode):
   tc.cache_images("data/coco_val", "./cache/coco336")  # one-liner build
   for imgs in tc.make_xs_loader("./cache/coco336", batch_size=256,
                                 device="cuda", num_workers=8):

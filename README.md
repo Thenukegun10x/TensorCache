@@ -8,7 +8,7 @@
 1. **Feature Cache Bloat:** `AMO-BQ` asymmetric MSE-optimal `G32` `1.09B` `1.83x` vs BF16 `0.47%` `rel RMSE` (`sym 1.06B 0.54%`) — near `G16` floor `0.39%`.
 2. **JPEG/PNG CPU Decode:** Zero-copy `mmap` + `GPU` stream prefetch `>2,000 MB/s`, ring-buffer `6.8MB` `VRAM` `batch8 128x768`.
 3. **Training Throughput (v0.2.2):** `iter_batches` `27k samp/s` `17.7GB/s` `B128 446x768` `~8.3x` vs `v0.2.0` `3.1k`, `Streamer` `21k` `5.1ms` `double-buffered` `pinned + async H2D` (`low_vram` `128MB` `B128`), `sharded 8x` for `H100 DDP`.
-4. **Pixel Cache Tunable JPEG-XS (v0.3.0):** `CDF 5/3` `4-lvl` `RCT` `4:2:0` `batched [3,H,W]` `GPU Triton` `out_buffer`, `adaptive RDO 4b` `G32` `16-lvl codebook` `TCQ-lite` `subband gains` `sparse bitstream` `zero-block skip` `hier nibble masks` `tunable` `44dB 3.2x` <-> `33dB 13.6x` (`balanced 37dB 7.8x`, `static 34dB 11.5x` measured COCO val 336) `presets ultra/high/balanced/compress/ultra_comp` `q_scale 1-8 lamb 1-50`.
+4. **Pixel Cache Tunable Wavelet XS (v0.3.0):** `CDF 5/3` `4-lvl` `RCT` `4:2:0` `batched [3,H,W]` `GPU Triton` `out_buffer`, `adaptive RDO 4b` `G32` `16-lvl codebook` `TCQ-lite` `subband gains` `sparse bitstream` `zero-block skip` `hier nibble masks` `tunable` `44dB 3.2x` <-> `33dB 13.6x` (`balanced 37dB 7.8x`, `static 34dB 11.5x` measured COCO val 336) `presets ultra/high/balanced/compress/ultra_comp` `q_scale 1-8 lamb 1-50`.
 
 ---
 
@@ -20,7 +20,7 @@
 * **Big Data Sharded:** `Writer(num_shards=8)` `->` `feat_shard{i}_*.bin` `+` `feat_shards.json`, `Dataset/Streamer(rank, world_size)` `DDP` `H100 8x` `~5.8k` random `27k` contiguous. Single shard `num_shards=1` unchanged `100%` compat.
 * **Minimal VRAM:** `q 5.22MB + scales 0.32MB + zp 0.16MB + out 10.45MB` `5.4M`; `G64` halves `scales/zp`.
 * **Cross-Platform:** `CUDA`/`ROCm` `Triton` else `PyTorch` fallback, `Windows` `mmap` safe `close()`.
-* **Tunable JPEG-XS Pixel:** `quantize_pixel_wavelet_adaptive(mode="balanced")` `lamb` `D+lamb*R` `G32 4b` `codebook 16` `TCQ-lite` `subband gains` `4:2:0` `sparse + zero-block skip + hier masks` `37dB 7.8x` (`44dB 3.2x` <-> `33dB 13.6x`, COCO val 336) `vs static 34dB 11.5x`.
+* **Tunable Wavelet XS Pixel:** `quantize_pixel_wavelet_adaptive(mode="balanced")` `lamb` `D+lamb*R` `G32 4b` `codebook 16` `TCQ-lite` `subband gains` `4:2:0` `sparse + zero-block skip + hier masks` `37dB 7.8x` (`44dB 3.2x` <-> `33dB 13.6x`, COCO val 336) `vs static 34dB 11.5x`.
 * **XS Image Pipeline (new):** `tc.cache_images(dir, prefix)` one-liner build → `tc.make_xs_loader(prefix, batch_size=256)` yields `uint8 [B,H,W,3]` on `CUDA` at `~10k img/s` sustained `@336` (`laptop 4050`, `file->GPU`, `workers=0`) — `6.7x` on `5000x COCO`, `GPU` mega-kernel batch decode (`K0/K1a/K1b/K1c/K2` + compiled synthesis, bit-exact), `spawn-safe` workers, `CPU` fallback bit-exact.
 * **Mono Grayscale Caches (v0.4.2):** `PixelCacheWriter(..., channels=1, quant=raw/int4/int3)` stores 1 sample/pixel — `3x` smaller (`110KB` vs `331KB` raw `336²`), grayscale-only ingest (color rejected, no silent conversion), `ds[i] -> uint8 [H,W,1]`. Mono `G=8` beats `RGB G=32` on both axes: `int4` RMSE `4.19` `83KB` vs `4.67` `186KB` — pass `group_size=8` for mono.
 * **CLI + Python one-liners:** `tc.compress` / `tc.benchmark_tensor` / `tensorcache benchmark`.
@@ -101,7 +101,14 @@ head = FusedDequantLinear(768, num_classes, group_size=32).cuda()
 logits = head(q, s) # dequant+GEMM in regs
 ```
 
-### 2b. XS Wavelet Image Cache (JPEG-XS style, GPU-decoded)
+### 2b. XS Wavelet Image Cache (TensorCache's own wavelet codec, GPU-decoded)
+
+> **Notation note:** "XS" is TensorCache's internal codec name for its original
+> wavelet image codec (CDF 5/3 lifting + RCT + adaptive RDO). It is **not** the
+> JPEG XS standard (ISO/IEC 21122), is not affiliated with or endorsed by any
+> JPEG XS rightsholder, does not implement that standard, and claims no
+> compliance with it.
+
 ```python
 import tensorcache as tc
 # One-liner build: dir of JPEGs/PNGs -> mmap cache (balanced default)

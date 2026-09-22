@@ -351,7 +351,7 @@ if HAS_TRITON:
 
 
     # -------------------------------------------------------------------------
-    # 2d. 8x GPU Wavelet Codec (JPEG-XS Style Dyadic Lifting + RCT)
+    # 2d. 8x GPU Wavelet Codec (Dyadic Lifting + RCT)
     # Fused Triton kernels: RCT shift-add + 5/3 lifting with replicate edge handling.
     # Each 2D step = 2x col lift (LL/LH, HL/HH) + 1x row lift -> 3 fused launches per level.
     # Autotuned BLOCK 64/128/256, num_warps 2/4, 1.5-2x fewer launches than PyTorch pad+slice.
