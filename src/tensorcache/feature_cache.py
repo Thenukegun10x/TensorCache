@@ -38,6 +38,7 @@ class FeatureCacheWriter:
         amo_mode: Optional[str] = None,
         num_shards: int = 1,
         quant_bits: int = 8,
+        resume: bool = False,
     ):
         self.output_prefix = Path(output_prefix)
         self.output_prefix.parent.mkdir(parents=True, exist_ok=True)
@@ -91,17 +92,34 @@ class FeatureCacheWriter:
             self.shard_prefixes = [str(self.output_prefix)]
             self.is_sharded = False
             int8_dtype = np.uint8 if amo_bq else np.int8
+            # resume: open existing files read-write ("w+" would wipe them),
+            # after grow-only truncate to the new capacity.
+            mm_mode = "r+" if resume else "w+"
+            if resume:
+                self._grow_file(
+                    self.int8_path,
+                    num_samples * seq_len * dim * np.dtype(int8_dtype).itemsize,
+                )
+                self._grow_file(
+                    self.scales_path,
+                    num_samples * self.scales_per_sample * np.dtype(np.uint16).itemsize,
+                )
+                if amo_bq:
+                    self._grow_file(
+                        self.zp_path,
+                        num_samples * self.scales_per_sample * np.dtype(np.uint8).itemsize,
+                    )
             self.mmap_int8 = np.memmap(
-                self.int8_path, dtype=int8_dtype, mode="w+",
+                self.int8_path, dtype=int8_dtype, mode=mm_mode,
                 shape=(num_samples, seq_len, dim)
             )
             self.mmap_scales = np.memmap(
-                self.scales_path, dtype=np.uint16, mode="w+",
+                self.scales_path, dtype=np.uint16, mode=mm_mode,
                 shape=(num_samples, self.scales_per_sample)
             )
             if amo_bq:
                 self.mmap_zp = np.memmap(
-                    self.zp_path, dtype=np.uint8, mode="w+",
+                    self.zp_path, dtype=np.uint8, mode=mm_mode,
                     shape=(num_samples, self.scales_per_sample)
                 )
             else:
@@ -109,6 +127,11 @@ class FeatureCacheWriter:
             self.shard_mmaps = None
             self.shard_sizes = [num_samples]
         else:
+            if resume:
+                raise NotImplementedError(
+                    "open_append supports single-shard caches only (num_shards=1); "
+                    "rebuild sharded caches instead"
+                )
             # Sharded: prefix_shard0, prefix_shard1, ...
             self.is_sharded = True
             self.shard_prefixes = [f"{self.output_prefix}_shard{i}" for i in range(self.num_shards)]
@@ -160,6 +183,96 @@ class FeatureCacheWriter:
             self.close()
         except Exception:
             pass
+
+    @staticmethod
+    def _grow_file(path, nbytes: int) -> None:
+        """Grow-only extend of a cache file to at least `nbytes`.
+        Existing bytes are never touched; shrinking is a no-op.
+        """
+        if path is None or not os.path.exists(path):
+            raise FileNotFoundError(f"cannot append: missing cache file {path!r}")
+        with open(path, "r+b") as f:
+            cur = f.seek(0, os.SEEK_END)
+            if cur < nbytes:
+                f.truncate(nbytes)
+
+    @classmethod
+    def open_append(
+        cls,
+        output_prefix: Union[str, Path],
+        extra_samples: int,
+        **expected_settings,
+    ) -> "FeatureCacheWriter":
+        """Reopen an existing single-shard cache for appending `extra_samples`.
+
+        Existing rows are preserved byte-for-byte; the files are grown (never
+        rewritten) and the meta count written by close() reflects the new total.
+
+        Any quant/layout settings passed here are asserted against the stored
+        meta and a ValueError is raised on mismatch (a silent mismatch would
+        corrupt interpretation of the cached rows):
+
+            w = FeatureCacheWriter.open_append("./cache/feat", 1000, group_size=32)
+            w.append(new_features)   # continues at the old tail
+            w.close()                # meta num_samples = old + appended
+
+        Sharded caches (num_shards > 1) are not supported.
+        """
+        prefix = str(output_prefix)
+        extra_samples = int(extra_samples)
+        if extra_samples <= 0:
+            raise ValueError(f"extra_samples must be > 0, got {extra_samples}")
+        if os.path.exists(prefix + "_shards.json"):
+            raise NotImplementedError(
+                "open_append supports single-shard caches only (num_shards=1); "
+                "rebuild sharded caches instead"
+            )
+        meta_path = prefix + "_meta.json"
+        if not os.path.exists(meta_path):
+            raise FileNotFoundError(f"cannot append: missing cache meta {meta_path!r}")
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
+        if meta.get("num_shards", 1) > 1:
+            raise NotImplementedError(
+                "open_append supports single-shard caches only (num_shards=1)"
+            )
+
+        # Reject any mismatch in quant/layout settings up-front (before files
+        # are touched) — a silent mismatch corrupts row interpretation.
+        defaults = {"quant_bits": 8}
+        for key, want in expected_settings.items():
+            if key not in ("seq_len", "dim", "group_size", "adaptive", "amo_bq",
+                           "amo_mode", "amo_lo", "amo_hi", "amo_candidates",
+                           "quant_bits"):
+                raise TypeError(f"unknown cache setting {key!r}")
+            have = meta.get(key, defaults.get(key))
+            if want is not None and have is not None and want != have:
+                raise ValueError(
+                    f"append settings mismatch for {key!r}: cache has {have!r}, "
+                    f"got {want!r} — refusing to append to a differently-encoded cache"
+                )
+
+        # Derive writer settings from the stored meta
+        kw = dict(
+            seq_len=meta["seq_len"],
+            dim=meta["dim"],
+            group_size=meta["group_size"],
+            adaptive=meta.get("adaptive", False),
+            amo_bq=meta.get("amo_bq", False),
+            quant_bits=meta.get("quant_bits", 8),
+        )
+        if kw["amo_bq"]:
+            if meta.get("amo_mode"):
+                kw["amo_mode"] = meta["amo_mode"]
+            else:
+                kw["amo_lo"] = meta.get("amo_lo", 0.95)
+                kw["amo_hi"] = meta.get("amo_hi", 1.05)
+                kw["amo_candidates"] = meta.get("amo_candidates", 32)
+
+        old_total = int(meta["num_samples"])
+        obj = cls(output_prefix, old_total + extra_samples, resume=True, **kw)
+        obj.current_idx = old_total  # continue from the existing tail
+        return obj
 
     def _shard_for_global(self, global_idx: int):
         """Return (shard_idx, local_idx) for global sample index."""
@@ -419,6 +532,7 @@ class FeatureCacheWriter:
             "amo_lo": self.amo_lo if self.amo_bq else None,
             "amo_hi": self.amo_hi if self.amo_bq else None,
             "amo_candidates": self.amo_candidates if self.amo_bq else None,
+            "quant_bits": self.quant_bits,
             "int8_file": os.path.basename(self.int8_path),
             "scales_file": os.path.basename(self.scales_path),
             "zp_file": os.path.basename(self.zp_path) if self.amo_bq else None,

@@ -386,10 +386,86 @@ def test_xs_loader_ease_of_use():
         print("[+] XS loader ease-of-use OK (cache_images + loader + pickle)")
 
 
+def test_feature_cache_append_mode():
+    """open_append grows an existing cache in place: old rows byte-identical,
+    new rows identical to a from-scratch encode, meta count = new total."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        prefix = Path(tmpdir) / "append_feat"
+        ref_prefix = Path(tmpdir) / "ref_feat"
+        N, M, seq_len, dim = 12, 7, 64, 128
+
+        torch.manual_seed(0)
+        feats_old = torch.randn(N, seq_len, dim, dtype=torch.bfloat16)
+        feats_new = torch.randn(M, seq_len, dim, dtype=torch.bfloat16)
+
+        # 1. Base cache
+        writer = FeatureCacheWriter(prefix, num_samples=N, seq_len=seq_len, dim=dim, group_size=32)
+        writer.append(feats_old)
+        writer.close()
+
+        # 2. Settings mismatches must be rejected BEFORE any file is touched
+        with pytest.raises(ValueError):
+            FeatureCacheWriter.open_append(prefix, M, dim=999)
+        with pytest.raises(ValueError):
+            FeatureCacheWriter.open_append(prefix, M, group_size=16)
+        with pytest.raises(ValueError):
+            FeatureCacheWriter.open_append(prefix, M, amo_bq=True)
+        with pytest.raises(FileNotFoundError):
+            FeatureCacheWriter.open_append(Path(tmpdir) / "nope", M)
+
+        # 3. Append M samples at the tail
+        writer2 = FeatureCacheWriter.open_append(prefix, extra_samples=M, group_size=32)
+        assert writer2.current_idx == N  # continues from existing tail
+        writer2.append(feats_new)
+        writer2.close()
+
+        # meta must record the new total (current_idx), not the pre-allocated N+M
+        # capacity window start, and not the old N
+        import json as _json
+        with open(str(prefix) + "_meta.json") as f:
+            meta = _json.load(f)
+        assert meta["num_samples"] == N + M
+
+        # 4. Read back and compare against a from-scratch encode of all N+M
+        ref = FeatureCacheWriter(ref_prefix, num_samples=N + M, seq_len=seq_len, dim=dim, group_size=32)
+        ref.append(torch.cat([feats_old, feats_new], dim=0))
+        ref.close()
+
+        ds = FeatureCacheDataset(prefix)
+        ref_ds = FeatureCacheDataset(ref_prefix)
+        assert len(ds) == N + M
+        for i in range(N + M):
+            q, s = ds[i]
+            rq, rs = ref_ds[i]
+            assert torch.equal(q, rq), f"int8 row {i} differs from from-scratch encode"
+            assert torch.equal(s, rs), f"scales row {i} differs from from-scratch encode"
+        ds.close()
+        ref_ds.close()
+
+        # 5. Capacity: appending beyond extra_samples must raise (not corrupt)
+        writer3 = FeatureCacheWriter.open_append(prefix, extra_samples=1)
+        with pytest.raises(ValueError):
+            writer3.append(torch.randn(2, seq_len, dim, dtype=torch.bfloat16))
+        writer3.close()
+        with open(str(prefix) + "_meta.json") as f:
+            assert _json.load(f)["num_samples"] == N + M  # unchanged after failed over-append
+
+        # 6. Sharded caches are explicitly unsupported
+        sharded_prefix = Path(tmpdir) / "sharded_feat"
+        wsh = FeatureCacheWriter(sharded_prefix, num_samples=4, seq_len=seq_len,
+                                 dim=dim, group_size=32, num_shards=2)
+        wsh.append(torch.randn(4, seq_len, dim, dtype=torch.bfloat16))
+        wsh.close()
+        with pytest.raises(NotImplementedError):
+            FeatureCacheWriter.open_append(sharded_prefix, 1)
+        print("[+] FeatureCache append mode test passed!")
+
+
 if __name__ == "__main__":
     test_quantize_dequantize_roundtrip()
     test_adaptive_quantize_roundtrip()
     test_feature_cache_disk_io()
+    test_feature_cache_append_mode()
     test_pixel_cache_disk_io()
     test_int4_int3_roundtrip()
     test_pixel_cache_quantized_disk_io()
