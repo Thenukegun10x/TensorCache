@@ -95,13 +95,15 @@ def normalize(counts) -> List[int]:
             break  # unreachable; guards against a hang
         freq[best] -= 1
         s -= 1
-    while s < TOT:
+    if s < TOT:
+        # Increment loop always targets the same symbol: argmax keeps winning
+        # after +1 (ties resolve to the lowest index), so the whole deficit
+        # lands on one symbol. Apply it in one shot instead of drift*256 scans.
         best = 0
         for i in range(1, 256):
             if freq[i] > freq[best]:
                 best = i
-        freq[best] += 1
-        s += 1
+        freq[best] += TOT - s
     return freq
 
 
@@ -268,9 +270,10 @@ def encode(data: bytes) -> bytes:
 
     Deterministic and byte-identical to Texel's Rust `rans::encode`.
     """
-    counts = [0] * 256
-    for b in data:
-        counts[b] += 1
+    # Histogram via numpy (C loop, GIL-free): the pure-Python byte loop was
+    # ~74% of encode() even on the numba path. Same counts -> same bitstream.
+    counts = np.bincount(np.frombuffer(data, dtype=np.uint8),
+                         minlength=256).tolist()
     q, freq, start, used = _freq_start(counts)
     n = len(data)
 

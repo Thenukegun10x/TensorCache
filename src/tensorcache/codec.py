@@ -1745,6 +1745,142 @@ def sparse_pack_plane(
             "occ": occ_bytes, "vals": vals, "shape": (h, w), "M": M}
 
 
+def _bits_to_padded_bytes(bits: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
+    """Pack a 1-D bit stream into per-group LSB-first bytes, padding each group
+    to a whole byte. Vectorized replacement for the per-group
+    ``(bits.view(-1, 8) * w8).sum(-1)`` idiom.
+
+    bits:   [total] uint8/bool, groups concatenated in order.
+    counts: [N] long, bit count per group (group g -> ceil(counts[g]/8) bytes).
+    """
+    counts = counts.to(torch.long)
+    padded = ((counts + 7) // 8) * 8
+    total = int(bits.numel())
+    if total == 0:
+        return torch.zeros(0, dtype=torch.uint8, device=bits.device)
+    dev = bits.device
+    out_starts = padded.cumsum(0) - padded          # bit start per group (output)
+    in_starts = counts.cumsum(0) - counts           # bit start per group (input)
+    gid = torch.repeat_interleave(torch.arange(counts.numel(), device=dev), counts)
+    gbit = out_starts[gid] + (torch.arange(total, device=dev) - in_starts[gid])
+    acc = torch.zeros(int(padded.sum().item()) // 8, dtype=torch.int32, device=dev)
+    acc.index_add_(0, (gbit >> 3).to(torch.long),
+                   (bits.to(torch.int32) << (gbit & 7).to(torch.int32)))
+    return acc.to(torch.uint8)
+
+
+def _nibbles_to_padded_bytes(vals: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
+    """Pack a 1-D nibble stream (0-15) into per-group LSB-first bytes, padding
+    each group to an even nibble count. Vectorized replacement for per-group
+    ``_pack_4b``.
+
+    vals:   [total] uint8, groups concatenated in order.
+    counts: [N] long, nibble count per group (group g -> ceil(counts[g]/2) bytes).
+    """
+    counts = counts.to(torch.long)
+    padded = ((counts + 1) // 2) * 2
+    total = int(vals.numel())
+    if total == 0:
+        return torch.zeros(0, dtype=torch.uint8, device=vals.device)
+    dev = vals.device
+    out_starts = padded.cumsum(0) - padded          # nibble start per group (output)
+    in_starts = counts.cumsum(0) - counts           # nibble start per group (input)
+    gid = torch.repeat_interleave(torch.arange(counts.numel(), device=dev), counts)
+    pos = out_starts[gid] + (torch.arange(total, device=dev) - in_starts[gid])
+    acc = torch.zeros(int(padded.sum().item()) // 2, dtype=torch.int32, device=dev)
+    acc.index_add_(0, (pos >> 1).to(torch.long),
+                   (vals.to(torch.int32) << ((pos & 1) * 4).to(torch.int32)))
+    return acc.to(torch.uint8)
+
+
+def _segment_counts(n: int, idx: torch.Tensor) -> torch.Tensor:
+    """Count occurrences of each value in idx (values in [0, n))."""
+    return torch.zeros(n, dtype=torch.long, device=idx.device).scatter_add_(
+        0, idx.to(torch.long), torch.ones_like(idx, dtype=torch.long))
+
+
+def _segment_sum(n: int, idx: torch.Tensor, vals: torch.Tensor) -> torch.Tensor:
+    """Sum vals grouped by idx (values in [0, n))."""
+    return torch.zeros(n, dtype=vals.dtype, device=vals.device).scatter_add_(
+        0, idx.to(torch.long), vals)
+
+
+def sparse_pack_plane_batched(
+    q_planes: torch.Tensor,
+    G: int = 32,
+) -> list:
+    """Vectorized ``sparse_pack_plane`` over a batch of identical-shape planes.
+
+    ``q_planes`` is int8 [N, h, w]; returns N plane dicts, each byte-identical
+    to a per-plane ``sparse_pack_plane`` call (same schema, same blob bytes).
+    All N planes must share (h, w) so the block grid M is uniform — exactly the
+    layout invariant the XS pixel cache already enforces.
+    """
+    if G != 32:
+        raise ValueError(f"sparse bitstream requires G=32, got {G}")
+    if q_planes.dim() != 3:
+        raise ValueError(f"expected [N, h, w], got {tuple(q_planes.shape)}")
+    dev = q_planes.device
+    N, h, w = q_planes.shape
+    flat = q_planes.reshape(N, -1).to(torch.int8)
+    Npix = h * w
+    pad = (G - Npix % G) % G
+    if pad:
+        flat = F.pad(flat, (0, pad))
+    blocks = flat.view(N, -1, G)  # [N, M, G]
+    M = blocks.shape[1]
+    nz = blocks != 0  # [N, M, G]
+    w8 = (1 << torch.arange(8, device=dev)).to(torch.uint8)
+    occ = nz.any(-1).to(torch.uint8)  # [N, M]
+    occ_pad = (8 - M % 8) % 8
+    if occ_pad:
+        occ = F.pad(occ, (0, occ_pad))
+    occ_bytes = (occ.view(N, -1, 8) * w8).sum(-1).to(torch.uint8)  # [N, ceil(M/8)]
+    occ_b = occ[:, :M].bool()  # [N, M]
+    Mo_n = occ_b.sum(1)  # [N]
+    occ_sel = occ_b.reshape(-1)
+    onz = nz.reshape(N * M, G)[occ_sel]  # occupied-block nonzeros (no re-detect)
+    Mo = onz.shape[0]
+    nib_any = onz.view(Mo, 8, 4).any(-1) if Mo else \
+        torch.zeros(0, 8, dtype=torch.bool, device=dev)
+    k = nib_any.sum(-1)  # [sumMo]
+    use_hier = k <= 5
+    mode_bits = use_hier.to(torch.uint8)
+    blk_img = torch.repeat_interleave(torch.arange(N, device=dev), Mo_n)
+    mode_len_n = (Mo_n + 7) // 8
+    mode_bytes = _bits_to_padded_bytes(mode_bits, Mo_n)
+    # flat vs hier masks
+    fbnz = onz[~use_hier].view(-1, 4, 8).to(torch.uint8)
+    flat_masks = (fbnz * w8).sum(-1).to(torch.uint8)  # [Mf_total, 4]
+    hbnz = onz[use_hier]  # [Mh_total, G]
+    hnib_any = hbnz.view(-1, 8, 4).any(-1)  # [Mh_total, 8]
+    hflags = (hnib_any.to(torch.uint8) * w8).sum(-1).to(torch.uint8)  # [Mh_total]
+    nib4 = (hbnz.view(-1, 8, 4).to(torch.uint8)
+            * torch.tensor([1, 2, 4, 8], device=dev).to(torch.uint8)).sum(-1)
+    hnib_vals = nib4.reshape(-1)[hnib_any.reshape(-1)].to(torch.uint8)  # [nnib_total]
+    nnib_n = _segment_sum(N, blk_img[use_hier], k[use_hier]) if Mo else \
+        torch.zeros(N, dtype=torch.long, device=dev)
+    hnib = _nibbles_to_padded_bytes(hnib_vals, nnib_n)
+    vals = blocks.reshape(-1)[nz.reshape(-1)].to(torch.int8)  # [nnz_total]
+    Mf_n = _segment_counts(N, blk_img[~use_hier]) if Mo else \
+        torch.zeros(N, dtype=torch.long, device=dev)
+    Mh_n = _segment_counts(N, blk_img[use_hier]) if Mo else \
+        torch.zeros(N, dtype=torch.long, device=dev)
+    nnz_n = _segment_sum(N, blk_img, onz.sum(1)) if Mo else \
+        torch.zeros(N, dtype=torch.long, device=dev)
+    mode_l = torch.split(mode_bytes, mode_len_n.tolist())
+    mask_l = torch.split(flat_masks, Mf_n.tolist())
+    hflag_l = torch.split(hflags, Mh_n.tolist())
+    hnib_l = torch.split(hnib, ((nnib_n + 1) // 2).tolist())
+    vals_l = torch.split(vals, nnz_n.tolist())
+    return [
+        {"mask": mask_l[i], "hflags": hflag_l[i], "hnib": hnib_l[i],
+         "mode": mode_l[i], "occ": occ_bytes[i], "vals": vals_l[i].to(torch.int8),
+         "shape": (h, w), "M": M}
+        for i in range(N)
+    ]
+
+
 def sparse_unpack_plane(
     packed: dict,
     G: int = 32,
@@ -1835,6 +1971,77 @@ def sparse_pack_meta(packed_meta: dict, G: int = 32) -> dict:
         out["q_scale"] = packed_meta.get("q_scale")
         out["lamb"] = packed_meta.get("lamb")
         out["mode"] = packed_meta.get("mode")
+    return out
+
+
+_ADAPTIVE_PLANE_ORDER = ("LH4", "HL4", "HH4", "LH3", "HL3", "HH3",
+                         "LH2", "HL2", "HH2", "LH1", "HL1", "HH1")
+
+
+def sparse_pack_meta_batched(metas: list, G: int = 32) -> list:
+    """Vectorized ``sparse_pack_meta`` over a batch of packed_meta dicts.
+
+    One ``sparse_pack_plane_batched`` call per (channel, level, plane-type)
+    instead of one ``sparse_pack_plane`` per image per plane, so the Python /
+    torch dispatch count drops ~Nx while the emitted bytes stay identical.
+    All metas must share the same structure (same H/W/mode/adaptive) — the
+    layout invariant the XS pixel cache already enforces.
+    """
+    if not metas:
+        raise ValueError("sparse_pack_meta_batched requires at least one meta")
+    adaptive = bool(metas[0].get("adaptive", False))
+    if any(bool(m.get("adaptive", False)) != adaptive for m in metas):
+        raise ValueError("all metas must share the adaptive flag")
+    N = len(metas)
+    chans = [[] for _ in range(N)]
+    for c, ch0 in enumerate(metas[0]["channels"]):
+        entries = [{"LL4": m["channels"][c]["LL4"].to(torch.int16).cpu()} for m in metas]
+        if adaptive:
+            names = [n for n in _ADAPTIVE_PLANE_ORDER if n in ch0]
+            for name in names:
+                planes = torch.stack(
+                    [m["channels"][c][name][0].cpu().to(torch.int8) for m in metas], 0)
+                packed = sparse_pack_plane_batched(planes, G)
+                for i in range(N):
+                    p = packed[i]
+                    p["idx_packed"] = metas[i]["channels"][c][name][1].cpu()
+                    p["bq"] = int(metas[i]["channels"][c][name][2])
+                    entries[i][name] = p
+        else:
+            lvls = [l for l in ("L4", "L3", "L2", "L1") if l in ch0]
+            for i in range(N):
+                for lvl in lvls:
+                    entries[i][lvl] = {
+                        "planes": {},
+                        "q": int(metas[i]["channels"][c][lvl][3]),
+                    }
+            for lvl in lvls:
+                for j, pn in enumerate(("LH", "HL", "HH")):
+                    planes = torch.stack(
+                        [m["channels"][c][lvl][j].cpu().to(torch.int8)
+                         for m in metas], 0)
+                    packed = sparse_pack_plane_batched(planes, G)
+                    for i in range(N):
+                        entries[i][lvl]["planes"][pn] = packed[i]
+        for i in range(N):
+            chans[i].append(entries[i])
+    out = []
+    for i in range(N):
+        m = metas[i]
+        d = {
+            "adaptive": adaptive,
+            "G": G,
+            "orig_shape": m["orig_shape"],
+            "pad_h": m["pad_h"],
+            "pad_w": m["pad_w"],
+            "channels": chans[i],
+        }
+        if adaptive:
+            d["codebook"] = m["codebook"].cpu()
+            d["q_scale"] = m.get("q_scale")
+            d["lamb"] = m.get("lamb")
+            d["mode"] = m.get("mode")
+        out.append(d)
     return out
 
 
@@ -2011,6 +2218,43 @@ def sparse_unpack_meta_gpu(sparse: dict, device: str | torch.device) -> dict:
     return out
 
 
+_EMPTY_U8 = torch.zeros(0, dtype=torch.uint8)
+
+
+def _arena_inv(sparse: dict) -> list:
+    """Fixed channel-major plane order: (name, channel, h, w, M)."""
+    adaptive = bool(sparse.get("adaptive", False))
+    inv = []
+    for c, ch in enumerate(sparse["channels"]):
+        if adaptive:
+            for n in _ADAPTIVE_PLANE_ORDER:
+                if n not in ch:
+                    continue
+                p = ch[n]
+                h, w = tuple(p["shape"])
+                inv.append((n, c, h, w, int(p["M"])))
+        else:
+            for lvl in ("L4", "L3", "L2", "L1"):
+                if lvl not in ch:
+                    continue
+                for pn in ("LH", "HL", "HH"):
+                    p = ch[lvl]["planes"][pn]
+                    h, w = tuple(p["shape"])
+                    inv.append((pn + lvl[1:], c, h, w, int(p["M"])))
+    return inv
+
+
+def _arena_plane_fields(sparse: dict, adaptive: bool, name: str, c: int):
+    """(op, idx_flat, param) for one inv plane: raw blobs + param."""
+    ch = sparse["channels"][c]
+    if adaptive:
+        op = ch[name]
+        return op, op["idx_packed"].reshape(-1), int(op["bq"])
+    lvl, pn = "L" + name[2:], name[:2]
+    e = ch[lvl]
+    return e["planes"][pn], None, int(e["q"]) * (2 if pn == "HH" else 1)
+
+
 def sparse_pack_arena(sparse: dict) -> dict:
     """Repackage a sparse bitstream dict into the arena stored format.
 
@@ -2023,57 +2267,35 @@ def sparse_pack_arena(sparse: dict) -> dict:
     inv entries: (name, channel, h, w, M); static names normalized ('LH4').
     """
     adaptive = bool(sparse.get("adaptive", False))
-    inv = []  # fixed plane order: channel-major
-    for c, ch in enumerate(sparse["channels"]):
-        if adaptive:
-            names = [n for n in ("LH4", "HL4", "HH4", "LH3", "HL3", "HH3",
-                                 "LH2", "HL2", "HH2", "LH1", "HL1", "HH1") if n in ch]
-            for n in names:
-                p = ch[n]
-                h, w = tuple(p["shape"])
-                inv.append((n, c, h, w, int(p["M"])))
-        else:
-            for lvl in ("L4", "L3", "L2", "L1"):
-                if lvl not in ch:
-                    continue
-                for pn in ("LH", "HL", "HH"):
-                    p = ch[lvl]["planes"][pn]
-                    h, w = tuple(p["shape"])
-                    inv.append((pn + lvl[1:], c, h, w, int(p["M"])))
+    inv = _arena_inv(sparse)
     P = len(inv)
-    meta = torch.zeros((P, 8), dtype=torch.int32)
-    au8, ai8 = [], []
+    au8, ai8, meta_rows = [], [], []
     ll4_parts = [ch["LL4"].to(torch.int16).reshape(-1) for ch in sparse["channels"]]
     ll4_shapes = [tuple(ch["LL4"].shape) for ch in sparse["channels"]]
     ou = oi = 0
-    for i, (name, c, h, w, M) in enumerate(inv):
-        ch = sparse["channels"][c]
-        if adaptive:
-            op, ip, param = ch[name], ch[name]["idx_packed"], int(ch[name]["bq"])
-        else:
-            lvl, pn = "L" + name[2:], name[:2]
-            e = ch[lvl]
-            op, ip = e["planes"][pn], None
-            param = int(e["q"]) * (2 if pn == "HH" else 1)
+    for name, c, h, w, M in inv:
+        op, ip, param = _arena_plane_fields(sparse, adaptive, name, c)
         occ = op["occ"].reshape(-1)
         mode = op["mode"].reshape(-1)
         fmask = op["mask"].reshape(-1)
         hfl = op["hflags"].reshape(-1)
         hnib = op["hnib"].reshape(-1)
-        idx = ip.reshape(-1) if ip is not None else torch.zeros(0, dtype=torch.uint8)
+        idx = ip if ip is not None else _EMPTY_U8
         vals = op["vals"].reshape(-1)
-        meta[i, 0] = ou
-        meta[i, 1] = ou + occ.numel()
-        meta[i, 2] = ou + occ.numel() + mode.numel()
-        meta[i, 3] = ou + occ.numel() + mode.numel() + fmask.numel()
-        meta[i, 7] = ou + occ.numel() + mode.numel() + fmask.numel() + hfl.numel()
-        meta[i, 4] = oi
-        meta[i, 6] = param
+        n_occ, n_mode, n_fmask, n_hfl, n_hnib, n_idx = (
+            occ.numel(), mode.numel(), fmask.numel(), hfl.numel(), hnib.numel(), idx.numel())
+        o1 = ou + n_occ
+        o2 = o1 + n_mode
+        o3 = o2 + n_fmask
+        o7 = o3 + n_hfl
+        ox = o7 + n_hnib
+        meta_rows.append([ou, o1, o2, o3, oi, ox, param, o7])
         au8 += [occ, mode, fmask, hfl, hnib, idx]
         ai8 += [vals]
-        ou = ou + occ.numel() + mode.numel() + fmask.numel() + hfl.numel() + hnib.numel() + idx.numel()
+        ou = ox + n_idx
         oi += vals.numel()
-        meta[i, 5] = ou - idx.numel()  # idx base
+    meta = (torch.tensor(meta_rows, dtype=torch.int32) if meta_rows
+            else torch.zeros((0, 8), dtype=torch.int32))
     out = {
         "format": "xs-arena-v1",
         "adaptive": adaptive,
@@ -2095,6 +2317,18 @@ def sparse_pack_arena(sparse: dict) -> dict:
         out["lamb"] = sparse.get("lamb")
         out["mode"] = sparse.get("mode")
     return out
+
+
+def sparse_pack_arena_batched(sparses: list) -> list:
+    """Pack a batch of sparse dicts into arenas, byte-identical to
+    ``[sparse_pack_arena(s) for s in sparses]``.
+
+    Measured faster than a fully vectorized permutation: the per-image arena
+    build is already one ``torch.cat`` per stream with a Python-computed meta
+    table, while a batch-wide [plane][section][image] -> [image][plane][section]
+    gather costs more in repeat_interleave allocations than it saves.
+    """
+    return [sparse_pack_arena(s) for s in sparses]
 
 
 def arena_to_sparse(arena: dict) -> dict:

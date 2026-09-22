@@ -26,12 +26,15 @@ from .codec import (
     quantize_pixel_wavelet_adaptive,
     dequantize_pixel_wavelet_adaptive,
     sparse_pack_plane,
+    sparse_pack_plane_batched,
     sparse_unpack_plane,
     sparse_unpack_plane_gpu,
     sparse_pack_meta,
+    sparse_pack_meta_batched,
     sparse_unpack_meta,
     sparse_unpack_meta_gpu,
     sparse_pack_arena,
+    sparse_pack_arena_batched,
     arena_to_sparse,
     arena_nbytes,
     sparse_nbytes,
@@ -75,7 +78,7 @@ from .pixel_cache import (
 )
 from .streamer import ZeroCopyTensorStreamer
 
-__version__ = "0.5.0"
+__version__ = "0.6.1"
 __all__ = [
     "BlockwiseInt8Codec",
     "quantize_int8_g32",
@@ -99,12 +102,15 @@ __all__ = [
     "quantize_pixel_wavelet_adaptive",
     "dequantize_pixel_wavelet_adaptive",
     "sparse_pack_plane",
+    "sparse_pack_plane_batched",
     "sparse_unpack_plane",
     "sparse_unpack_plane_gpu",
     "sparse_pack_meta",
+    "sparse_pack_meta_batched",
     "sparse_unpack_meta",
     "sparse_unpack_meta_gpu",
     "sparse_pack_arena",
+    "sparse_pack_arena_batched",
     "arena_to_sparse",
     "arena_nbytes",
     "sparse_nbytes",

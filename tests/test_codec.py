@@ -297,6 +297,91 @@ def test_sparse_bitstream_roundtrip():
           f"(static {raw_bytes/sparse_nbytes(sp):.2f}x, adaptive {raw_bytes/sparse_nbytes(asp):.2f}x)")
 
 
+def test_sparse_pack_batched_bit_exact():
+    """Batched pack must be byte-identical to the per-image reference for both
+    static and adaptive sparse bitstreams, and the writer's append_batch must
+    produce a decode-identical cache (dense white-noise sample included)."""
+    from tensorcache.codec import (
+        quantize_pixel_wavelet8x, quantize_pixel_wavelet_adaptive,
+        sparse_pack_meta, sparse_pack_meta_batched,
+        sparse_pack_arena, sparse_pack_arena_batched,
+    )
+    H, W = 64, 64
+    N = 5
+    imgs = [_natural_test_img(H, W, seed=s) for s in range(N - 1)]
+    # dense occupancy -> exercises nonzero alignment pads in every blob
+    torch.manual_seed(0)
+    imgs.append(torch.randint(0, 256, (H, W, 3), dtype=torch.uint8))
+
+    for adaptive in (False, True):
+        if adaptive:
+            metas = [quantize_pixel_wavelet_adaptive(im, mode="balanced")[0] for im in imgs]
+        else:
+            metas = [quantize_pixel_wavelet8x(im, q_scale=3.0)[0] for im in imgs]
+        ref_sp = [sparse_pack_meta(m) for m in metas]
+        ref_ar = [sparse_pack_arena(s) for s in ref_sp]
+        got_sp = sparse_pack_meta_batched(metas)
+        got_ar = sparse_pack_arena_batched(got_sp)
+        for i in range(N):
+            for c in range(3):
+                rc, gc = ref_sp[i]["channels"][c], got_sp[i]["channels"][c]
+                assert torch.equal(rc["LL4"].to(torch.int64), gc["LL4"].to(torch.int64))
+                for name, rp in rc.items():
+                    if name == "LL4":
+                        continue
+                    gp = gc[name]
+                    for f in ("mask", "hflags", "hnib", "mode", "occ", "vals",
+                              "idx_packed"):
+                        if f not in rp:
+                            continue
+                        assert torch.equal(rp[f].to(torch.int64), gp[f].to(torch.int64)), \
+                            f"meta {adaptive=} img={i} ch={c} {name}.{f}"
+            for k in ("arena_u8", "arena_i8", "meta", "ll4"):
+                assert torch.equal(ref_ar[i][k].to(torch.int64),
+                                   got_ar[i][k].to(torch.int64)), \
+                    f"arena {adaptive=} img={i} {k}"
+            assert ref_ar[i]["inv"] == got_ar[i]["inv"]
+        # N=1 must also work (no batching edge case)
+        one = sparse_pack_arena_batched(sparse_pack_meta_batched(metas[:1]))
+        assert torch.equal(one[0]["arena_u8"].to(torch.int64),
+                           ref_ar[0]["arena_u8"].to(torch.int64))
+
+    # writer: append_batch(images=...) == per-image append_image (bit-exact cache)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        p_loop = str(Path(tmpdir) / "loop")
+        p_batch = str(Path(tmpdir) / "batch")
+        w1 = PixelCacheWriter(p_loop, num_samples=N, height=H, width=W,
+                              channels=3, quant="xs", xs_mode="balanced")
+        for im in imgs:
+            w1.append_image(im.numpy())
+        w1.close()
+        w2 = PixelCacheWriter(p_batch, num_samples=N, height=H, width=W,
+                              channels=3, quant="xs", xs_mode="balanced")
+        assert w2.append_batch(images=[im.numpy() for im in imgs]) == N
+        w2.close()
+
+        # pre-encoded metas path (external batched encoder) must match too
+        p_meta = str(Path(tmpdir) / "meta")
+        w3 = PixelCacheWriter(p_meta, num_samples=N, height=H, width=W,
+                              channels=3, quant="xs", xs_mode="balanced")
+        pre = [quantize_pixel_wavelet_adaptive(im, mode="balanced")[0] for im in imgs]
+        assert w3.append_batch(metas=pre) == N
+        w3.close()
+
+        d1 = PixelCacheDataset(p_loop, decode_device="cpu")
+        d2 = PixelCacheDataset(p_batch, decode_device="cpu")
+        d3 = PixelCacheDataset(p_meta, decode_device="cpu")
+        ref = d1.decode_arenas([d1.get_arena(i) for i in range(N)], device="cpu")
+        assert torch.equal(
+            ref, d2.decode_arenas([d2.get_arena(i) for i in range(N)], device="cpu"))
+        assert torch.equal(
+            ref, d3.decode_arenas([d3.get_arena(i) for i in range(N)], device="cpu"))
+        d1.close()
+        d2.close()
+        d3.close()
+    print("[+] Batched sparse pack bit-exact (meta + arena + append_batch)")
+
+
 def test_xs_pixel_cache():
     """XS wavelet PixelCache: write arenas -> single/batch decode bit-exact."""
     from tensorcache.codec import (quantize_pixel_wavelet_adaptive,
@@ -538,6 +623,7 @@ if __name__ == "__main__":
     test_mono_pixel_cache()
     test_wavelet_8x_codec()
     test_sparse_bitstream_roundtrip()
+    test_sparse_pack_batched_bit_exact()
     test_xs_pixel_cache()
     test_xs_entropy_parity_and_backcompat()
     test_xs_loader_ease_of_use()

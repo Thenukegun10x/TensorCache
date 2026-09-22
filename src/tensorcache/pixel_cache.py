@@ -180,13 +180,20 @@ class PixelCacheWriter:
         scales_u16 = scales.view(torch.int16).cpu().numpy().view(np.uint16)
         return q_packed, scales_u16
 
-    def _append_xs(self, arr: np.ndarray):
-        """Encode one uint8 [H,W,C] image to an xs arena and stream it to disk."""
-        from .codec import (quantize_pixel_wavelet_adaptive, sparse_pack_meta,
-                            sparse_pack_arena)
+    def _encode_xs(self, arr: np.ndarray) -> dict:
+        """uint8 [H,W,C] -> packed_meta (encoder only; no disk I/O)."""
+        from .codec import quantize_pixel_wavelet_adaptive
         t = torch.from_numpy(arr).to(torch.uint8)
         meta, _ = quantize_pixel_wavelet_adaptive(t, mode=self.xs_mode, chroma420=self.chroma420)
-        arena = sparse_pack_arena(sparse_pack_meta(meta))
+        return meta
+
+    def _append_xs(self, arr: np.ndarray):
+        """Encode one uint8 [H,W,C] image to an xs arena and stream it to disk."""
+        from .codec import sparse_pack_meta, sparse_pack_arena
+        self._write_arena(sparse_pack_arena(sparse_pack_meta(self._encode_xs(arr))))
+
+    def _write_arena(self, arena: dict):
+        """Stream one encoded xs arena to disk (shared layout + entropy + row)."""
         # Fixed-size training assumption: every sample shares the layout.
         shared = {
             "inv": [(n, c, h, w, m) for (n, c, h, w, m) in arena["inv"]],
@@ -249,16 +256,8 @@ class PixelCacheWriter:
         self._xs_orows += P
         self._xs_oll4 += len(l4_raw) // 2
 
-    def append_image(self, img_input: Union[np.ndarray, Image.Image, torch.Tensor, str, Path]):
-        """
-        Appends an image to the raw memory map. Automatically resizes if needed.
-        Supports quant="raw" (uint8) and quant="int4"/"int3" (packed + scales).
-        Mono caches (channels=1) accept grayscale input ([H,W], [H,W,1], PIL "L")
-        and reject 3-channel input; RGB caches accept both [H,W] (replicated) and 3ch.
-        """
-        if self.current_idx >= self.num_samples:
-            raise ValueError(f"Exceeded pre-allocated sample count ({self.num_samples})")
-
+    def _normalize_image(self, img_input: Union[np.ndarray, Image.Image, torch.Tensor, str, Path]) -> np.ndarray:
+        """Coerce any accepted input to uint8 [H, W, channels] at cache resolution."""
         if isinstance(img_input, (str, Path)):
             with Image.open(img_input) as im:
                 if self.channels == 3:
@@ -299,6 +298,18 @@ class PixelCacheWriter:
                 raise ValueError("mono cache (channels=1) rejects 3-channel input; pass [H,W] grayscale")
         else:
             raise ValueError(f"unsupported image shape {arr.shape}")
+        return arr
+
+    def append_image(self, img_input: Union[np.ndarray, Image.Image, torch.Tensor, str, Path]):
+        """
+        Appends an image to the raw memory map. Automatically resizes if needed.
+        Supports quant="raw" (uint8) and quant="int4"/"int3" (packed + scales).
+        Mono caches (channels=1) accept grayscale input ([H,W], [H,W,1], PIL "L")
+        and reject 3-channel input; RGB caches accept both [H,W] (replicated) and 3ch.
+        """
+        if self.current_idx >= self.num_samples:
+            raise ValueError(f"Exceeded pre-allocated sample count ({self.num_samples})")
+        arr = self._normalize_image(img_input)
 
         if self.quant == "raw":
             self.mmap_pixels[self.current_idx] = arr
@@ -316,6 +327,43 @@ class PixelCacheWriter:
             self.mmap_q[self.current_idx] = q_packed[:q_bytes]
             self.mmap_scales[self.current_idx] = scales_u16
         self.current_idx += 1
+
+    def append_batch(self, metas: Optional[list] = None,
+                     images: Optional[list] = None) -> int:
+        """Append a batch of samples with one vectorized pack pass.
+
+        For quant="xs" the whole batch is packed via ``sparse_pack_meta_batched``
+        + ``sparse_pack_arena_batched`` (one torch pass per plane-type instead of
+        one per image), then each arena is streamed. Pass either pre-encoded
+        ``metas`` (from an external batched encoder) or raw ``images`` to encode
+        here. Other quant modes fall back to per-image ``append_image``.
+
+        Returns the number of samples appended.
+        """
+        if metas is None and images is None:
+            raise ValueError("append_batch requires metas or images")
+        if metas is not None:
+            metas = list(metas)
+        if self.quant != "xs":
+            if images is None:
+                raise ValueError("append_batch for non-xs caches requires images")
+            n = 0
+            for img in images:
+                self.append_image(img)
+                n += 1
+            return n
+        if metas is None:
+            metas = [self._encode_xs(self._normalize_image(img)) for img in images]
+        if not metas:
+            return 0
+        if self.current_idx + len(metas) > self.num_samples:
+            raise ValueError(f"Exceeded pre-allocated sample count ({self.num_samples})")
+        from .codec import sparse_pack_meta_batched, sparse_pack_arena_batched
+        arenas = sparse_pack_arena_batched(sparse_pack_meta_batched(metas))
+        for arena in arenas:
+            self._write_arena(arena)
+            self.current_idx += 1
+        return len(arenas)
 
     def close(self):
         if getattr(self, "_closed", False):
