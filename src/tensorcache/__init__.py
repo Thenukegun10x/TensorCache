@@ -24,6 +24,7 @@ from .codec import (
     quantize_pixel_wavelet8x,
     dequantize_pixel_wavelet8x,
     quantize_pixel_wavelet_adaptive,
+    quantize_pixel_wavelet_adaptive_batched,
     dequantize_pixel_wavelet_adaptive,
     sparse_pack_plane,
     sparse_pack_plane_batched,
@@ -78,7 +79,7 @@ from .pixel_cache import (
 )
 from .streamer import ZeroCopyTensorStreamer
 
-__version__ = "0.6.1"
+__version__ = "0.6.2"
 __all__ = [
     "BlockwiseInt8Codec",
     "quantize_int8_g32",
@@ -100,6 +101,7 @@ __all__ = [
     "quantize_pixel_wavelet8x",
     "dequantize_pixel_wavelet8x",
     "quantize_pixel_wavelet_adaptive",
+    "quantize_pixel_wavelet_adaptive_batched",
     "dequantize_pixel_wavelet_adaptive",
     "sparse_pack_plane",
     "sparse_pack_plane_batched",

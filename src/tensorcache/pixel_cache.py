@@ -336,7 +336,10 @@ class PixelCacheWriter:
         + ``sparse_pack_arena_batched`` (one torch pass per plane-type instead of
         one per image), then each arena is streamed. Pass either pre-encoded
         ``metas`` (from an external batched encoder) or raw ``images`` to encode
-        here. Other quant modes fall back to per-image ``append_image``.
+        here. ``images`` may be a single ``[N,H,W,3]`` torch tensor (or a list of
+        same-shape tensors/arrays), which routes through the batched GPU encoder
+        ``quantize_pixel_wavelet_adaptive_batched`` — one pass for the whole
+        batch. Other quant modes fall back to per-image ``append_image``.
 
         Returns the number of samples appended.
         """
@@ -353,7 +356,16 @@ class PixelCacheWriter:
                 n += 1
             return n
         if metas is None:
-            metas = [self._encode_xs(self._normalize_image(img)) for img in images]
+            batch = images
+            if isinstance(batch, (list, tuple)) and batch \
+                    and isinstance(batch[0], torch.Tensor):
+                batch = torch.stack(list(batch), 0)
+            if isinstance(batch, torch.Tensor) and batch.dim() == 4:
+                from .codec import quantize_pixel_wavelet_adaptive_batched
+                metas = quantize_pixel_wavelet_adaptive_batched(
+                    batch, mode=self.xs_mode, chroma420=self.chroma420)
+            else:
+                metas = [self._encode_xs(self._normalize_image(img)) for img in images]
         if not metas:
             return 0
         if self.current_idx + len(metas) > self.num_samples:

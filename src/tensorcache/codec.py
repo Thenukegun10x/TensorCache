@@ -1431,6 +1431,59 @@ def _quant_adaptive_plane(
     idx_packed = _pack_4b(idx)
     return q_plane, idx_packed, rec
 
+def _quant_adaptive_plane_batched(
+    coeff: torch.Tensor,  # [Nb, H, W] int32
+    base_q: int,
+    codebook: torch.Tensor,  # [C] float
+    lamb: float,
+    G: int = 32,
+    gain: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Batched ``_quant_adaptive_plane`` over a leading image dim.
+
+    Bit-identical to calling the per-plane version on each ``coeff[n]``.
+    Returns (q_int8 [Nb,H,W], idx_packed uint8 [Nb,(M+1)//2], rec_int32 [Nb,H,W]).
+    """
+    Nb, H, W = coeff.shape
+    flat = coeff.reshape(Nb, -1).float()  # [Nb, Npix]
+    Npix = H * W
+    pad = (G - Npix % G) % G
+    if pad:
+        flat = F.pad(flat, (0, pad))
+    blocks = flat.view(Nb, -1, G)  # [Nb, M, G]
+    M = blocks.shape[1]
+    cand_steps = base_q * codebook.to(blocks.device).float()  # [C]
+    steps = cand_steps.view(1, 1, -1, 1)  # [1,1,C,1]
+    cand_q = torch.round(blocks.unsqueeze(2) / steps).clamp(-128, 127)  # [Nb,M,C,G]
+    cand_rec = cand_q * steps
+    D = ((blocks.unsqueeze(2) - cand_rec) ** 2).sum(-1) * gain  # [Nb,M,C]
+    nz = (cand_q != 0)  # [Nb,M,C,G]
+    nnz = nz.sum(-1).float()  # [Nb,M,C]
+    if G == 32:
+        k = nz.view(Nb, M, -1, 8, 4).any(-1).sum(-1).float()  # [Nb,M,C]
+        maskbits = torch.where(k <= 5, 8.0 + 4.0 * k, torch.full_like(k, 32.0))
+        R = torch.where(nnz == 0, torch.ones_like(nnz), 6.0 + maskbits + 8.0 * nnz)
+    else:
+        R = torch.where(nnz == 0, torch.ones_like(nnz), 37.0 + 8.0 * nnz)
+    cost = D + lamb * R
+    best = cost.argmin(-1)  # [Nb,M]
+    best_steps = cand_steps[best]  # [Nb,M]
+    q_blocks = torch.round(blocks / best_steps.unsqueeze(-1)).clamp(-128, 127).to(torch.int8)
+    s = best_steps.unsqueeze(-1)  # [Nb,M,1]
+    q0 = q_blocks.to(torch.int16)
+    qc = torch.stack([q0 - 1, q0, q0 + 1], dim=-1).clamp(-128, 127)  # [Nb,M,G,3]
+    dc = gain * (blocks.unsqueeze(-1).float() - qc.float() * s.unsqueeze(-1).float()) ** 2
+    rc = lamb * 8.0 * (qc != 0).float()
+    q_blocks = qc.gather(-1, (dc + rc).argmin(-1, keepdim=True)).squeeze(-1).to(torch.int8)
+    rec_blocks = q_blocks.float() * best_steps.unsqueeze(-1)
+    rec = rec_blocks.reshape(Nb, -1)[:, :Npix].reshape(Nb, H, W).to(torch.int32)
+    q_plane = q_blocks.reshape(Nb, -1)[:, :Npix].reshape(Nb, H, W).to(torch.int8)
+    idx = best.to(torch.uint8)  # [Nb,M]
+    counts = torch.full((Nb,), M, dtype=torch.long, device=idx.device)
+    idx_packed = _nibbles_to_padded_bytes(idx.reshape(-1), counts).view(Nb, -1)
+    return q_plane, idx_packed, rec
+
+
 def _dequant_adaptive_plane(
     q_plane: torch.Tensor,  # [H,W] int8
     idx_packed: torch.Tensor,  # [(M+1)//2] uint8
@@ -1601,6 +1654,138 @@ def quantize_pixel_wavelet_adaptive(
         'mode': mode,
         'chroma420': chroma420,
     }, (H, W, C)
+
+
+def quantize_pixel_wavelet_adaptive_batched(
+    imgs: torch.Tensor,  # [N,H,W,3]
+    q_scale: float = 3.0,
+    lamb: float = 5.0,
+    G: int = 32,
+    codebook: torch.Tensor | None = None,
+    mode: str | None = None,
+    chroma420: bool | None = None,
+) -> list:
+    """Batched ``quantize_pixel_wavelet_adaptive`` over N images.
+
+    Runs RCT + DWT + per-plane RDO over the batch dim (one torch pass per
+    plane instead of one per image per plane) and splits into N packed_meta
+    dicts that are bit-identical to the per-image reference. All images must
+    share H/W (the XS cache layout invariant). Returns a list of N dicts with
+    the same schema as the single-image encoder.
+    """
+    if mode is not None:
+        if mode not in WAVELET_ADAPTIVE_PRESETS:
+            raise ValueError(f"Unknown mode {mode}, choose from {list(WAVELET_ADAPTIVE_PRESETS)}")
+        q_scale, lamb = WAVELET_ADAPTIVE_PRESETS[mode]
+    if chroma420 is None:
+        chroma420 = False if mode in ("ultra", "high") else True
+    if codebook is None:
+        codebook = ADAPTIVE_CODEBOOK
+    codebook = codebook.to(torch.float32)
+
+    if imgs.dim() != 4:
+        raise ValueError(f"expected [N,H,W,3], got {tuple(imgs.shape)}")
+    N, H, W, C = imgs.shape
+    t = imgs.to(torch.int32)
+    pad_h = (16 - H % 16) % 16
+    pad_w = (16 - W % 16) % 16
+    if pad_h > 0 or pad_w > 0:
+        t = F.pad(t.permute(0, 3, 1, 2), (0, pad_w, 0, pad_h),
+                  mode='replicate').permute(0, 2, 3, 1)
+
+    yuv = rct_forward(t)  # [N,Hp,Wp,3]
+    yuv_b = yuv.permute(0, 3, 1, 2).contiguous()  # [N,3,Hp,Wp]
+    Y = yuv_b[:, 0]  # [N,Hp,Wp]
+    Hp, Wp = Y.shape[-2], Y.shape[-1]
+    Cc_raw = yuv_b[:, 1:3].reshape(N * 2, Hp, Wp)  # [N*2,Hp,Wp]
+    Cc2 = _downsample2(Cc_raw) if chroma420 else Cc_raw  # [N*2,hc,wc]
+    dev = yuv_b.device
+
+    def make_qs(scale, c_f_y=1.0, c_f_c=1.8):
+        return torch.tensor([max(1, int(round(scale * c_f_y))),
+                             max(1, int(round(scale * c_f_c))),
+                             max(1, int(round(scale * c_f_c)))], device=dev)
+    q_l4 = make_qs(q_scale * 0.5)
+    q_l3 = make_qs(q_scale * 1.0)
+    q_l2 = make_qs(q_scale * 2.0)
+    q_l1 = make_qs(q_scale * 4.0)
+
+    def ch2(x):  # [N*2,h,w] -> [N,2,h,w]
+        return x.view(N, 2, x.shape[-2], x.shape[-1])
+
+    YL1, YLH1, YHL1, YHH1 = _dwt_53_2d_step_batched(Y)
+    YL2, YLH2, YHL2, YHH2 = _dwt_53_2d_step_batched(YL1)
+    YL3, YLH3, YHL3, YHH3 = _dwt_53_2d_step_batched(YL2)
+    YL4, YLH4, YHL4, YHH4 = _dwt_53_2d_step_batched(YL3)
+    if chroma420:
+        CL2, CLH2, CHL2, CHH2 = _dwt_53_2d_step_batched(Cc2)
+        CL3, CLH3, CHL3, CHH3 = _dwt_53_2d_step_batched(CL2)
+        CL4, CLH4, CHL4, CHH4 = _dwt_53_2d_step_batched(CL3)
+    else:
+        CL1, CLH1, CHL1, CHH1 = _dwt_53_2d_step_batched(Cc2)
+        CL2, CLH2, CHL2, CHH2 = _dwt_53_2d_step_batched(CL1)
+        CL3, CLH3, CHL3, CHH3 = _dwt_53_2d_step_batched(CL2)
+        CL4, CLH4, CHL4, CHH4 = _dwt_53_2d_step_batched(CL3)
+
+    def stk(y, c):  # [N,h,w] + [N*2,h,w] -> [N,3,h,w]
+        return torch.cat([y.unsqueeze(1), ch2(c)], dim=1)
+    LL4 = stk(YL4, CL4)
+    LH4, HL4, HH4 = stk(YLH4, CLH4), stk(YHL4, CHL4), stk(YHH4, CHH4)
+    LH3, HL3, HH3 = stk(YLH3, CLH3), stk(YHL3, CHL3), stk(YHH3, CHH3)
+    LH2, HL2, HH2 = stk(YLH2, CLH2), stk(YHL2, CHL2), stk(YHH2, CHH2)
+    if chroma420:
+        LH1, HL1, HH1 = YLH1.unsqueeze(1), YHL1.unsqueeze(1), YHH1.unsqueeze(1)
+    else:
+        LH1, HL1, HH1 = stk(YLH1, CLH1), stk(YHL1, CHL1), stk(YHH1, CHH1)
+
+    level_planes = [
+        ("LH4", LH4, q_l4), ("HL4", HL4, q_l4), ("HH4", HH4, q_l4 * 2),
+        ("LH3", LH3, q_l3), ("HL3", HL3, q_l3), ("HH3", HH3, q_l3 * 2),
+        ("LH2", LH2, q_l2), ("HL2", HL2, q_l2), ("HH2", HH2, q_l2 * 2),
+        ("LH1", LH1, q_l1), ("HL1", HL1, q_l1), ("HH1", HH1, q_l1 * 2),
+    ]
+    zero_hh = "HH2" if chroma420 else "HH1"
+
+    res = {}
+    for (name, tens, baseq_all) in level_planes:
+        k = tens.shape[1]
+        for c in range(k):
+            bq = int(baseq_all[c].item())
+            if name == zero_hh and c > 0:
+                h, w = tens.shape[-2], tens.shape[-1]
+                M = (h * w + G - 1) // G
+                res[(c, name)] = (
+                    torch.zeros((N, h, w), dtype=torch.int8, device=dev),
+                    torch.zeros((N, (M + 1) // 2), dtype=torch.uint8, device=dev),
+                    bq,
+                )
+                continue
+            gain = SUBBAND_GAINS[name] * (RCT_GAIN_Y if c == 0 else RCT_GAIN_C)
+            q, idxp, _ = _quant_adaptive_plane_batched(
+                tens[:, c], bq, codebook, lamb, G, gain=gain)
+            res[(c, name)] = (q, idxp, bq)
+
+    metas = []
+    for n in range(N):
+        chs = []
+        for c in range(3):
+            d = {'LL4': LL4[n, c].to(torch.int16)}
+            for (name, tens, _) in level_planes:
+                if c < tens.shape[1]:
+                    q, idxp, bq = res[(c, name)]
+                    d[name] = (q[n], idxp[n], bq)
+            chs.append(d)
+        metas.append({
+            'channels': chs,
+            'pad_h': pad_h, 'pad_w': pad_w,
+            'orig_shape': (H, W, C),
+            'adaptive': True, 'G': G,
+            'q_scale': q_scale, 'lamb': lamb,
+            'codebook': codebook.cpu(),
+            'mode': mode, 'chroma420': chroma420,
+        })
+    return metas
+
 
 def dequantize_pixel_wavelet_adaptive(
     packed_meta: dict,
@@ -1995,17 +2180,23 @@ def sparse_pack_meta_batched(metas: list, G: int = 32) -> list:
     N = len(metas)
     chans = [[] for _ in range(N)]
     for c, ch0 in enumerate(metas[0]["channels"]):
-        entries = [{"LL4": m["channels"][c]["LL4"].to(torch.int16).cpu()} for m in metas]
+        # One stack + one D2H per plane-type (not N per-tensor .cpu() syncs):
+        # matters when metas come from the GPU batched encoder.
+        ll4 = torch.stack([m["channels"][c]["LL4"] for m in metas], 0).to(torch.int16).cpu()
+        entries = [{"LL4": ll4[i]} for i in range(N)]
         if adaptive:
             names = [n for n in _ADAPTIVE_PLANE_ORDER if n in ch0]
             for name in names:
                 planes = torch.stack(
-                    [m["channels"][c][name][0].cpu().to(torch.int8) for m in metas], 0)
+                    [m["channels"][c][name][0] for m in metas], 0).cpu().to(torch.int8)
+                idxs = torch.stack(
+                    [m["channels"][c][name][1] for m in metas], 0).cpu()
+                bqs = [int(m["channels"][c][name][2]) for m in metas]
                 packed = sparse_pack_plane_batched(planes, G)
                 for i in range(N):
                     p = packed[i]
-                    p["idx_packed"] = metas[i]["channels"][c][name][1].cpu()
-                    p["bq"] = int(metas[i]["channels"][c][name][2])
+                    p["idx_packed"] = idxs[i]
+                    p["bq"] = bqs[i]
                     entries[i][name] = p
         else:
             lvls = [l for l in ("L4", "L3", "L2", "L1") if l in ch0]
@@ -2018,8 +2209,7 @@ def sparse_pack_meta_batched(metas: list, G: int = 32) -> list:
             for lvl in lvls:
                 for j, pn in enumerate(("LH", "HL", "HH")):
                     planes = torch.stack(
-                        [m["channels"][c][lvl][j].cpu().to(torch.int8)
-                         for m in metas], 0)
+                        [m["channels"][c][lvl][j] for m in metas], 0).cpu().to(torch.int8)
                     packed = sparse_pack_plane_batched(planes, G)
                     for i in range(N):
                         entries[i][lvl]["planes"][pn] = packed[i]

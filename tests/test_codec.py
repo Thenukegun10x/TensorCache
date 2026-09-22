@@ -382,6 +382,36 @@ def test_sparse_pack_batched_bit_exact():
     print("[+] Batched sparse pack bit-exact (meta + arena + append_batch)")
 
 
+def test_quantize_adaptive_batched_bit_exact():
+    """Batched adaptive encoder must be bit-identical to the per-image path
+    across modes (4:2:0 balanced, 4:4:4 high) and batch sizes."""
+    from tensorcache.codec import (quantize_pixel_wavelet_adaptive,
+                                   quantize_pixel_wavelet_adaptive_batched)
+    H = W = 64
+    for mode in ("balanced", "high"):
+        for N in (1, 3, 5):
+            imgs = [_natural_test_img(H, W, seed=s) for s in range(N)]
+            batch = torch.stack(imgs, 0)
+            ref = [quantize_pixel_wavelet_adaptive(im, mode=mode)[0] for im in imgs]
+            got = quantize_pixel_wavelet_adaptive_batched(batch, mode=mode)
+            assert len(got) == N
+            for n in range(N):
+                for c in range(3):
+                    rc, gc = ref[n]['channels'][c], got[n]['channels'][c]
+                    assert torch.equal(rc['LL4'].to(torch.int64),
+                                       gc['LL4'].to(torch.int64)), (mode, n, c, 'LL4')
+                    for name, rv in rc.items():
+                        if name == 'LL4':
+                            continue
+                        gv = gc[name]
+                        assert torch.equal(rv[0].to(torch.int64), gv[0].to(torch.int64)), \
+                            (mode, n, c, name, 'q')
+                        assert torch.equal(rv[1].to(torch.int64), gv[1].to(torch.int64)), \
+                            (mode, n, c, name, 'idx')
+                        assert rv[2] == gv[2], (mode, n, c, name, 'bq')
+    print("[+] Batched adaptive encoder bit-exact (balanced/high, N=1/3/5)")
+
+
 def test_xs_pixel_cache():
     """XS wavelet PixelCache: write arenas -> single/batch decode bit-exact."""
     from tensorcache.codec import (quantize_pixel_wavelet_adaptive,
@@ -624,6 +654,7 @@ if __name__ == "__main__":
     test_wavelet_8x_codec()
     test_sparse_bitstream_roundtrip()
     test_sparse_pack_batched_bit_exact()
+    test_quantize_adaptive_batched_bit_exact()
     test_xs_pixel_cache()
     test_xs_entropy_parity_and_backcompat()
     test_xs_loader_ease_of_use()
