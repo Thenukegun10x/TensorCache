@@ -45,6 +45,7 @@ class PixelCacheWriter:
         group_size: int = 32,
         xs_mode: str = "balanced",
         chroma420: Optional[bool] = None,
+        xs_entropy: bool = True,
     ):
         # Normalize quant args: quant="raw"/"int4"/"int3"/"xs" or quant_bits=8/4/3
         if quant_bits is not None:
@@ -66,6 +67,9 @@ class PixelCacheWriter:
         self.group_size = group_size
         self.xs_mode = xs_mode
         self.chroma420 = chroma420
+        # rANS entropy coding for quant='xs' sections (u8/i8/ll4; meta stays
+        # raw — measured loss). False writes the exact pre-0.6 v1 layout.
+        self.xs_entropy = bool(xs_entropy)
         self.quant_bits = 8 if quant in ("raw", "xs") else (4 if quant == "int4" else 3)
         self.output_prefix = Path(output_prefix)
         self.output_prefix.parent.mkdir(parents=True, exist_ok=True)
@@ -103,6 +107,7 @@ class PixelCacheWriter:
             self._xs_table = []  # per-sample offset/len rows (small: ~10 ints)
             self._xs_shared = None  # inv/P/B/orig_shape/adaptive/codebook... (from sample 0)
             self._xs_ou = self._xs_oi = self._xs_orows = self._xs_oll4 = 0
+            self._xs_lb = 0  # ll4 file byte cursor (stored = maybe planar/rANS)
             self.mmap_pixels = None
             self.mmap_q = None
             self.mmap_scales = None
@@ -204,22 +209,45 @@ class PixelCacheWriter:
         u8 = arena["arena_u8"].numpy().tobytes()
         i8 = arena["arena_i8"].numpy().tobytes()
         mt = arena["meta"].numpy().tobytes()
-        l4 = arena["ll4"].numpy().tobytes()
+        l4_raw = arena["ll4"].numpy().tobytes()
+        # Storage-layer entropy coding (CPU only; decoded back to byte-identical
+        # v1 arena bytes on read, so the GPU path never sees rANS):
+        #   u8/i8  — plain sections, [stored bytes] in their byte-offset files
+        #   ll4    — byte-planar (lo/hi planes rANS'd separately)
+        #   meta   — stays raw: measured -1.4% (table cost > redundancy)
+        enc = None
+        if self.xs_entropy:
+            from .rans import pack_byte_planar, pack_section
+            e0, u8 = pack_section(u8)
+            e1, i8 = pack_section(i8)
+            e3, l4 = pack_byte_planar(l4_raw)
+            enc = [e0, e1, 0, e3]
+        else:
+            l4 = l4_raw
         self._xs_fu8.write(u8)
         self._xs_fi8.write(i8)
         self._xs_fmeta.write(mt)
         self._xs_fll4.write(l4)
         P = shared["P"]
-        self._xs_table.append({
+        row = {
             "u8_off": self._xs_ou, "u8_len": len(u8),
             "i8_off": self._xs_oi, "i8_len": len(i8),
             "meta_row": self._xs_orows, "n_planes": P,
-            "ll4_off": self._xs_oll4, "ll4_len": len(l4) // 2,
-        })
+            # logical (decoded) ll4 element counts — same meaning as v1
+            "ll4_off": self._xs_oll4, "ll4_len": len(l4_raw) // 2,
+        }
+        if enc is not None:
+            # byte positions of the *stored* ll4 region (derived from the
+            # logical keys only for pre-entropy caches, which lack enc)
+            row["enc"] = enc
+            row["lb_off"] = self._xs_lb
+            row["lb_len"] = len(l4)
+            self._xs_lb += len(l4)
+        self._xs_table.append(row)
         self._xs_ou += len(u8)
         self._xs_oi += len(i8)
         self._xs_orows += P
-        self._xs_oll4 += len(l4) // 2
+        self._xs_oll4 += len(l4_raw) // 2
 
     def append_image(self, img_input: Union[np.ndarray, Image.Image, torch.Tensor, str, Path]):
         """
@@ -334,6 +362,7 @@ class PixelCacheWriter:
         if self.quant == "xs":
             meta["xs_mode"] = self.xs_mode
             meta["chroma420"] = self.chroma420
+            meta["xs_entropy"] = self.xs_entropy
             meta["xs_files"] = {
                 "u8": os.path.basename(self.xs_u8_path),
                 "i8": os.path.basename(self.xs_i8_path),
@@ -422,9 +451,10 @@ class PixelCacheDataset(Dataset):
             nrows = sum(r["n_planes"] for r in self.meta["xs_table"])
             self._xs_meta = np.memmap(str(d / xf["meta"]), dtype=np.int32, mode="r",
                                       shape=(nrows, 8))
-            nll4 = sum(r["ll4_len"] for r in self.meta["xs_table"])
-            self._xs_ll4 = np.memmap(str(d / xf["ll4"]), dtype=np.int16, mode="r",
-                                     shape=(nll4,))
+            # ll4 is byte-addressable: pre-entropy caches store dense int16
+            # (slices derived as elem_off*2), entropy caches store per-row
+            # regions via lb_off/lb_len that may be planar-wrapped blobs.
+            self._xs_ll4 = np.memmap(str(d / xf["ll4"]), dtype=np.uint8, mode="r")
             self._xs_shared = sh
             self._xs_inv = [(n, c, h, w, m) for (n, c, h, w, m) in sh["inv"]]
             self._xs_codebook = torch.tensor(sh["codebook"], dtype=torch.float32)
@@ -506,10 +536,27 @@ class PixelCacheDataset(Dataset):
         if not self._xs:
             raise RuntimeError("get_arena_packed requires quant='xs'")
         r = self.meta["xs_table"][idx]
-        u8 = np.array(self._xs_u8[r["u8_off"]:r["u8_off"] + r["u8_len"]])
-        i8 = np.array(self._xs_i8[r["i8_off"]:r["i8_off"] + r["i8_len"]])
+        enc = r.get("enc")  # absent in pre-entropy (v1) caches -> all raw
+        # Entropy-decode here (worker-side CPU front-end): the packed blob
+        # below is byte-identical to the v1 layout, so IPC fan-in, split and
+        # the GPU mega-kernel never change. Decoded sizes -> v1 semantics.
+        u8 = _xs_section(self._xs_u8[r["u8_off"]:r["u8_off"] + r["u8_len"]],
+                         enc[0] if enc else 0)
+        i8 = _xs_section(self._xs_i8[r["i8_off"]:r["i8_off"] + r["i8_len"]],
+                         enc[1] if enc else 0)
         mt = np.array(self._xs_meta[r["meta_row"]:r["meta_row"] + r["n_planes"]])
-        l4 = np.array(self._xs_ll4[r["ll4_off"]:r["ll4_off"] + r["ll4_len"]])
+        if enc:
+            stored_l4 = self._xs_ll4[r["lb_off"]:r["lb_off"] + r["lb_len"]]
+            if enc[3]:
+                from .rans import unpack_byte_planar
+                l4 = np.frombuffer(unpack_byte_planar(1, bytes(stored_l4)),
+                                   dtype=np.int16)
+            else:
+                l4 = np.array(stored_l4).view(np.int16)  # dense row, byte copy
+        else:
+            # v1: dense int16 at logical element offsets (ll4 file is uint8)
+            off = r["ll4_off"] * 2
+            l4 = np.array(self._xs_ll4[off:off + r["ll4_len"] * 2]).view(np.int16)
         # Pad the i8 section so the int32 meta view stays 4-aligned
         # (deterministic from lengths; also keeps ll4 2-aligned).
         pad = (-(u8.size + i8.size)) % 4
@@ -674,6 +721,7 @@ def cache_images(
     exts=_XS_IMAGE_EXTS,
     limit: Optional[int] = None,
     log_every: int = 500,
+    xs_entropy: bool = True,
 ) -> dict:
     """One-liner: encode a directory of images into a PixelCache.
 
@@ -690,7 +738,7 @@ def cache_images(
     t0 = time.perf_counter()
     writer = PixelCacheWriter(output_prefix, num_samples=len(files), height=height,
                               width=width, channels=3, quant=quant, xs_mode=xs_mode,
-                              chroma420=chroma420)
+                              chroma420=chroma420, xs_entropy=xs_entropy)
     for i, f in enumerate(files):
         writer.append_image(str(f))
         if (i + 1) % log_every == 0:
@@ -729,12 +777,17 @@ def make_xs_loader(
     """Training-ready iterator yielding decoded uint8 [B,H,W,3] GPU batches.
 
     Workers stay CPU-only (mmap arena slices); the main process batch-decodes
-    on GPU. num_workers=0 (default) is fastest here: delivery is ~30us/sample
-    from page cache with no IPC. With num_workers>0, each worker fans a whole
-    batch into ONE packed tensor (DataLoader IPC costs ~per transfer, so one
-    fat tensor/batch beats per-sample dicts ~5x) and the main process splits
-    it back into arena views (zero copies) before GPU decode. Typical next
-    step: `x = b.permute(0,3,1,2).float().div(255)` then normalize.
+    on GPU. With num_workers>0 each worker fans a whole batch into ONE packed
+    tensor (DataLoader IPC costs ~per transfer, so one fat tensor/batch beats
+    per-sample dicts ~5x) and the main process splits it back into arena views
+    (zero copies) before GPU decode. Typical next step:
+    `x = b.permute(0,3,1,2).float().div(255)` then normalize.
+
+    num_workers: entropy-coded caches (default since 0.6) rANS-decode in the
+    workers at ~0.2-0.3 ms/sample/core (~4.4k img/s/core), so use
+    num_workers>=4 to hide fetch behind GPU decode; num_workers=0 leaves the
+    main thread fetch-bound. Pre-entropy caches (~30us/sample) stay fastest at
+    num_workers=0.
 
     for imgs in tc.make_xs_loader("./cache/coco336", batch_size=256,
                                   device="cuda", num_workers=8):
@@ -749,6 +802,13 @@ def make_xs_loader(
         ds.close()
         raise ValueError("make_xs_loader requires quant='xs' (this cache is "
                          f"{ds.quant!r}; use a DataLoader over PixelCacheDataset directly)")
+    if num_workers == 0 and ds.meta.get("xs_entropy"):
+        import warnings
+        warnings.warn(
+            "entropy-coded xs cache (rANS): fetch costs ~0.2-0.3 ms/sample on "
+            "the main thread with num_workers=0, making the loader fetch-bound. "
+            "Use num_workers>=4 to hide it behind GPU decode.",
+            RuntimeWarning, stacklevel=2)
     if num_workers > 0:
         # Worker-side batch fan-in (one packed tensor per batch over IPC);
         # main-side collate splits it back into arena views (zero copies).
@@ -780,6 +840,21 @@ def make_xs_loader(
                 yield ds.decode_arenas(arena_batch, device=device)
     finally:
         ds.close()
+
+
+def _xs_section(stored, method: int) -> np.ndarray:
+    """One stored cache section -> decoded uint8/int8 copy (v1 semantics).
+
+    method 0 (or pre-entropy rows) = raw bytes; 1 = rANS blob. The rANS
+    path is CPU-only and runs in DataLoader workers, never on GPU.
+    """
+    if method == 0:
+        return np.array(stored)
+    if method == 1:
+        from .rans import unpack_section
+        return np.frombuffer(unpack_section(1, bytes(stored)), dtype=stored.dtype)
+    from .rans import RansError
+    raise RansError(f"unknown xs section method {method}")
 
 
 def _packed_len(u8_len: int, i8_len: int, n_planes: int, ll4_len: int) -> int:

@@ -343,6 +343,72 @@ def test_xs_pixel_cache():
         print("[+] XS PixelCache round-trip OK (single + batch + CPU fallback)")
 
 
+def test_xs_entropy_parity_and_backcompat():
+    """rANS storage layer (xs_entropy=True, default) must be invisible to
+    consumers: arenas decode bit-identically to the pre-entropy layout,
+    xs_entropy=False still writes v1 rows old readers accept, files shrink."""
+    import json
+    from tensorcache.pixel_cache import make_xs_loader
+    H, W, N = 64, 64, 5
+    imgs = [_natural_test_img(H, W, seed=s) for s in range(N - 1)]
+    # +1 white-noise image: dense occupancy exercises nonzero pads post-decode
+    torch.manual_seed(0)
+    imgs.append(torch.randint(0, 256, (H, W, 3), dtype=torch.uint8))
+
+    def build(prefix, entropy):
+        w = PixelCacheWriter(prefix, num_samples=N, height=H, width=W,
+                             channels=3, quant="xs", xs_mode="balanced",
+                             xs_entropy=entropy)
+        for im in imgs:
+            w.append_image(im.numpy())
+        w.close()
+
+    def file_sizes(prefix):
+        p = Path(prefix)
+        return [f.stat().st_size for f in p.parent.iterdir()
+                if f.name.startswith(p.name)]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        v1 = str(Path(tmpdir) / "v1")
+        v2 = str(Path(tmpdir) / "rans")
+        build(v1, entropy=False)
+        build(v2, entropy=True)
+
+        # v1 writer: rows carry no entropy keys (byte-layout = pre-0.6 format)
+        m1 = json.loads(Path(str(v1) + "_pixel_meta.json").read_text())
+        assert m1.get("xs_entropy") is False
+        assert all("enc" not in r and "lb_off" not in r for r in m1["xs_table"])
+
+        m2 = json.loads(Path(str(v2) + "_pixel_meta.json").read_text())
+        assert m2.get("xs_entropy") is True
+        assert all("enc" in r and "lb_off" in r for r in m2["xs_table"])
+        # meta section never entropy-coded (rANS measured at a loss on it)
+        assert all(r["enc"][2] == 0 for r in m2["xs_table"])
+        # entropy must actually shrink the payload files
+        assert sum(file_sizes(v2)) < sum(file_sizes(v1))
+
+        ds1 = PixelCacheDataset(v1, decode_device="cpu")
+        ds2 = PixelCacheDataset(v2, decode_device="cpu")
+        assert len(ds1) == len(ds2) == N
+        for i in range(N):
+            a, b = ds1.get_arena(i), ds2.get_arena(i)
+            for k in ("arena_u8", "arena_i8", "meta", "ll4"):
+                assert torch.equal(a[k], b[k]), f"arena {k} differs at sample {i}"
+            assert torch.equal(ds1[i], ds2[i]), f"decoded pixels differ at {i}"
+        ds1.close()
+        ds2.close()
+
+        # loader path: v1 vs entropy cache, multi-worker (fork/spawn safe)
+        got1 = torch.cat(list(make_xs_loader(v1, batch_size=2, device="cpu",
+                                             num_workers=0, shuffle=False)))
+        got2 = torch.cat(list(make_xs_loader(v2, batch_size=2, device="cpu",
+                                             num_workers=2, shuffle=False)))
+        assert got1.shape == got2.shape == (N, H, W, 3)
+        assert torch.equal(got1, got2)
+        print(f"[+] XS entropy parity OK (v1 {sum(file_sizes(v1))//1024}KB -> "
+              f"rans {sum(file_sizes(v2))//1024}KB, bit-identical decode)")
+
+
 def test_xs_loader_ease_of_use():
     """cache_images one-liner + make_xs_loader + spawn-safe pickling."""
     import pickle
@@ -473,6 +539,7 @@ if __name__ == "__main__":
     test_wavelet_8x_codec()
     test_sparse_bitstream_roundtrip()
     test_xs_pixel_cache()
+    test_xs_entropy_parity_and_backcompat()
     test_xs_loader_ease_of_use()
 
     print("\n[+] ALL UNIT TESTS PASSED SUCCESSFULLY!")

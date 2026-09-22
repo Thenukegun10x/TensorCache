@@ -22,10 +22,12 @@ Installation: `pip install tensorcache` or `pip install -e .` from repo root. Py
 │   ├── fused_ops.py       # Triton fused kernels (requires CUDA/ROCm + Triton)
 │   ├── feature_cache.py   # FeatureCacheWriter / FeatureCacheDataset (mmap .bin + .json)
 │   ├── pixel_cache.py     # PixelCacheWriter / PixelCacheDataset (raw uint8 mmap)
+│   ├── rans.py            # rANS entropy codec for XS sections (numba + Python ref)
 │   ├── prefetcher.py      # AsyncGPUPrefetcher (double-buffered CUDA stream)
 │   └── streamer.py        # ZeroCopyTensorStreamer (pinned + ring-buffered)
 ├── tests/
 │   ├── test_codec.py      # codec + feature/pixel disk I/O tests
+│   ├── test_rans.py       # rANS tests + Rust golden cross-check (tests/data/)
 │   └── test_fused_ops.py  # GPU-only, skipped if !torch.cuda.is_available()
 ├── benchmarks/
 │   ├── bench_memory_opt.py
@@ -88,6 +90,7 @@ No `Makefile`, no `opencode.json` yet, no CI config in repo. Use `pytest>=7.0` (
 
 ### 4.3 Pixel Cache (`src/tensorcache/pixel_cache.py:25-137`)
 - Raw `uint8` mmap `(N,H,W,C)` (`pixel_cache.py:48-51`). `append_image` accepts `np.ndarray | PIL.Image | torch.Tensor | str|Path` and resizes to `(width,height)` via `BILINEAR` (`pixel_cache.py:54-74`). `PixelCacheDataset.__getitem__` returns `torch.uint8 [H,W,C]` with `arr.copy()` (`pixel_cache.py:122-129`).
+- **XS arena cache (`quant="xs"`) + rANS entropy layer (default `xs_entropy=True`, 0.6+):** `_append_xs` writes 4 per-sample sections (u8/i8/meta/ll4) with an offset table in `_pixel_meta.json["xs_table"]`. With entropy on, u8/i8/ll4 are rANS-coded via `rans.py` (`pack_section`, `pack_byte_planar` — ll4 is byte-planar) and each row carries `enc=[u8,i8,meta,ll4]` method flags plus `lb_off/lb_len` ll4 byte positions; **meta stays raw** (rANS measured at a loss on int32 rows) and sections must shrink >=8% (`MIN_GAIN_PCT`) to be coded at all. `get_arena_packed` rANS-decodes worker-side back to byte-identical v1 arena bytes, so IPC fan-in, `unpack_arena` and the GPU mega-kernel are untouched (CPU front-end only, never GPU). `xs_entropy=False` writes the exact pre-0.6 v1 layout (no `enc` keys) — old readers keep working; new readers treat missing `enc` as all-raw. Measured on 5000 COCO-336 balanced: 6.74x -> 10.28x vs raw RGB (-34.4%); fetch ~0.2-0.3 ms/sample/core (~4.4k img/s/core) so entropy caches want `num_workers>=4`.
 
 ### 4.4 Fused Ops (`src/tensorcache/fused_ops.py:1-233`)
 - **Requires Triton + CUDA/ROCm** — hard import `import triton` at top (`fused_ops.py:17-18`) will fail on Windows/CPU. Guard imports or make optional if editing.
@@ -105,6 +108,7 @@ No `Makefile`, no `opencode.json` yet, no CI config in repo. Use `pytest>=7.0` (
 - **Triton fallback:** Any change to `codec.py` dequant must keep both Triton and PyTorch fallback paths bit-identical. Test on CPU.
 - **Memmap lifecycle:** Always provide `close()` and call it in tests (`tests/test_codec.py:78-80,102-104`). On Windows, open mmap prevents deletion.
 - **No dynamic allocations in hot path:** Streamer/prefetcher are designed for zero allocation — avoid `torch.empty` inside loops without `out_buffer`.
+- **XS entropy back-compat:** existing caches are never rewritten or invalidated — the format is per-cache, decided by `enc` row flags (+ `xs_entropy` marker) in `_pixel_meta.json`. New readers must keep the v1 branch (missing `enc` -> raw sections, ll4 offsets in int16 elements x2). New caches are unreadable by <0.6 readers (forward incompat, unavoidable). Keep `tests/test_rans.py` green: the Rust golden cross-check pins `encode`/`decode` byte-for-byte (`Texel/examples/rans_golden.rs` regenerates `tests/data/rans_goldens.bin`).
 - **Benchmark thresholds:** Rel RMSE `<1.0%` is the pass criterion (`tests/test_codec.py:36,51`, `tests/test_fused_ops.py:28`). Real Block-32 RMSE ~0.54% vs Naive FP8 ~2.6-5.2% (`compression_benchmark_results.json:126-148`, `190-201`).
 - **Security:** `tar.extractall` in `download_test_dataset.py:28` — keep as is for now but don't expand without validation if hardening.
 - **Formatting:** No enforced formatter; follow existing style (4-space indent, `from __future__ import annotations`, type hints).

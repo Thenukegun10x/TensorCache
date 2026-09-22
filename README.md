@@ -21,7 +21,7 @@
 * **Minimal VRAM:** `q 5.22MB + scales 0.32MB + zp 0.16MB + out 10.45MB` `5.4M`; `G64` halves `scales/zp`.
 * **Cross-Platform:** `CUDA`/`ROCm` `Triton` else `PyTorch` fallback, `Windows` `mmap` safe `close()`.
 * **Tunable Wavelet XS Pixel:** `quantize_pixel_wavelet_adaptive(mode="balanced")` `lamb` `D+lamb*R` `G32 4b` `codebook 16` `TCQ-lite` `subband gains` `4:2:0` `sparse + zero-block skip + hier masks` `37dB 7.8x` (`44dB 3.2x` <-> `33dB 13.6x`, COCO val 336) `vs static 34dB 11.5x`.
-* **XS Image Pipeline (new):** `tc.cache_images(dir, prefix)` one-liner build → `tc.make_xs_loader(prefix, batch_size=256)` yields `uint8 [B,H,W,3]` on `CUDA` at `~10k img/s` sustained `@336` (`laptop 4050`, `file->GPU`, `workers=0`) — `6.7x` on `5000x COCO`, `GPU` mega-kernel batch decode (`K0/K1a/K1b/K1c/K2` + compiled synthesis, bit-exact), `spawn-safe` workers, `CPU` fallback bit-exact.
+* **XS Image Pipeline (new):** `tc.cache_images(dir, prefix)` one-liner build → `tc.make_xs_loader(prefix, batch_size=256)` yields `uint8 [B,H,W,3]` on `CUDA` at `~10k img/s` sustained `@336` (`laptop 4050`, `file->GPU`) — `10.3x` on `5000x COCO` with rANS entropy-coded sections (0.6 default; `fetch ~4.4k img/s/core`, so use `workers>=4`), `GPU` mega-kernel batch decode (`K0/K1a/K1b/K1c/K2` + compiled synthesis, bit-exact), `spawn-safe` workers, `CPU` fallback bit-exact.
 * **Mono Grayscale Caches (v0.4.2):** `PixelCacheWriter(..., channels=1, quant=raw/int4/int3)` stores 1 sample/pixel — `3x` smaller (`110KB` vs `331KB` raw `336²`), grayscale-only ingest (color rejected, no silent conversion), `ds[i] -> uint8 [H,W,1]`. Mono `G=8` beats `RGB G=32` on both axes: `int4` RMSE `4.19` `83KB` vs `4.67` `186KB` — pass `group_size=8` for mono.
 * **CLI + Python one-liners:** `tc.compress` / `tc.benchmark_tensor` / `tensorcache benchmark`.
 
@@ -113,24 +113,24 @@ logits = head(q, s) # dequant+GEMM in regs
 import tensorcache as tc
 # One-liner build: dir of JPEGs/PNGs -> mmap cache (balanced default)
 info = tc.cache_images("data/coco_val", "./cache/coco336")
-# -> {"num_samples": 5000, "ratio_vs_raw": 6.74, "ms_per_img": 58, ...}
+# -> {"num_samples": 5000, "ratio_vs_raw": 10.28, "ms_per_img": 38, ...}
 
 # Training loop: page-cache slices in, GPU batches out (workers optional)
 for imgs in tc.make_xs_loader("./cache/coco336", batch_size=256,
                               device="cuda", num_workers=8):
     train(imgs)  # uint8 [B,H,W,3] on CUDA
 ```
-Fidelity presets (`xs_mode`, measured `16x COCO val 336`, `1x` = raw `RGB`):
+Fidelity presets (`xs_mode`, measured `16x COCO val 336`, `1x` = raw `RGB`, ratios include the default rANS entropy layer — lossless, so `PSNR`/`SSIM` are unchanged):
 
 | preset | PSNR | SSIM | ratio | enhances |
 |---|:---:|:---:|:---:|---|
-| ultra (`4:4:4`) | `44.4dB` | `0.993` | `3.2x` | transparent — invisible even flipped |
-| high (`4:4:4`) | `39.8dB` | — | `5.6x` | high quality |
-| balanced (`4:2:0`, default) | `36.8dB` | `0.97` | `7.8x` | invisible at normal viewing |
-| compress (`4:2:0`) | `35.3dB` | — | `9.8x` | high compression |
-| ultra_comp (`4:2:0`) | `33.0dB` | `0.92` | `13.6x` | visible softening in busy texture |
+| ultra (`4:4:4`) | `44.4dB` | `0.993` | `4.5x` | transparent — invisible even flipped |
+| high (`4:4:4`) | `39.8dB` | — | `8.2x` | high quality |
+| balanced (`4:2:0`, default) | `36.8dB` | `0.97` | `10.7x` | invisible at normal viewing |
+| compress (`4:2:0`) | `35.3dB` | — | `13.6x` | high compression |
+| ultra_comp (`4:2:0`) | `33.0dB` | `0.92` | `19.3x` | visible softening in busy texture |
 
-Throughput (`balanced`, `336²`, `laptop RTX 4050`, sustained medians):
+Throughput (`balanced`, `336²`, `laptop RTX 4050`, sustained medians; measured on the pre-0.6 dense-storage layout):
 
 | path | img/s | notes |
 |---|:---:|---|
@@ -140,7 +140,9 @@ Throughput (`balanced`, `336²`, `laptop RTX 4050`, sustained medians):
 | single image | `~1.2k` | `0.8ms`, `out_buffer` zero-alloc |
 | `PIL JPEG` `8 workers` (status quo) | `~0.8-1k` | what training does today |
 
-`ViT-B` burns `~1-1.5k img/s/GPU` — the cache feeds `~10x` headroom on a laptop card while moving `43KB/img` (`~430MB/s H2D`, `PCIe` idle). Bigger GPUs just want bigger batches (`RTX PRO` saturates ~`BS256+`); `GB10` fits whole datasets in `128GB` unified memory. `CPU` fallback is bit-exact (`Windows`-safe, no `Triton` needed).
+Since 0.6 the XS sections are rANS entropy-coded by default (`xs_entropy=True`): caches are `~1.5x` smaller, at the cost of a CPU front-end that decodes at `~4.4k img/s/core` (`~0.2-0.3ms/sample`). Use `num_workers>=4` in `make_xs_loader` so fetch hides behind GPU decode; `num_workers=0` becomes fetch-bound. Pass `xs_entropy=False` for the old layout/throughput (e.g. tiny caches where CPU time matters more than bytes).
+
+`ViT-B` burns `~1-1.5k img/s/GPU` — the cache feeds `~10x` headroom on a laptop card while moving `33KB/img` (`~330MB/s H2D`, `PCIe` idle). Bigger GPUs just want bigger batches (`RTX PRO` saturates ~`BS256+`); `GB10` fits whole datasets in `128GB` unified memory. `CPU` fallback is bit-exact (`Windows`-safe, no `Triton` needed).
 
 Chroma is choosable: `cache_images(..., chroma420=False)` forces `4:4:4` (default auto: `ultra`/`high` → `4:4:4`, below → `4:2:0`), `chroma420=True` forces `4:2:0`. Same flag on `PixelCacheWriter`. Forcing `4:4:4` on `balanced` = `+1.4dB` for `+16%` bytes (`38.7dB` `96x` vs `37.3dB` `112x`, COCO `336`).
 
