@@ -1,5 +1,7 @@
 [build-system]
-requires = ["hatchling"]
+# hatchling >=1.32 emits Core Metadata 2.5 (PEP 794), which PyPI still rejects;
+# pin <1.32 so wheels/sdists build as Metadata 2.4.
+requires = ["hatchling >= 1.26, < 1.32"]
 build-backend = "hatchling.build"
 
 [project]
