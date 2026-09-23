@@ -142,6 +142,16 @@ Throughput (`balanced`, `336²`, `laptop RTX 4050`, sustained medians; measured 
 
 Since 0.6 the XS sections are rANS entropy-coded by default (`xs_entropy=True`): caches are `~1.5x` smaller, at the cost of a CPU front-end that decodes at `~4.4k img/s/core` (`~0.2-0.3ms/sample`). Use `num_workers>=4` in `make_xs_loader` so fetch hides behind GPU decode; `num_workers=0` becomes fetch-bound. Pass `xs_entropy=False` for the old layout/throughput (e.g. tiny caches where CPU time matters more than bytes).
 
+**0.7 adds `xs_entropy="tans"`** — a dictionary block-tANS codec that decodes on the GPU:
+
+```python
+tc.cache_images("data/coco_val", "./cache/coco336", xs_entropy="tans")  # learns a dict from 256 imgs
+for imgs in tc.make_xs_loader("./cache/coco336", batch_size=256, num_workers=0):  # main-process GPU decode
+    ...
+```
+
+It is `+5-6%` smaller than rANS at cache scale (`10.56x -> 11.20x` on COCO-336/256 imgs) and the entropy decode runs on-device at `~50k img/s`, adding `~+15%` to the wavelet decode at `B=128` (`~9.4k img/s e2e`). Because the CPU path would be *slower* than rANS, tANS caches require a CUDA/ROCm device and `num_workers=0` (the main process does entropy + wavelet decode); the reader is validated bit-identical against the rANS cache. The build stores the dictionary once in `_pixel_meta.json` (`~25KB`), so it amortizes (`+6.1%` at 256 images, more at 5000). `xs_entropy` also accepts a prebuilt `tans_dict` (path or `{kind: tables}`) to share one dictionary across caches.
+
 `ViT-B` burns `~1-1.5k img/s/GPU` — the cache feeds `~10x` headroom on a laptop card while moving `33KB/img` (`~330MB/s H2D`, `PCIe` idle). Bigger GPUs just want bigger batches (`RTX PRO` saturates ~`BS256+`); `GB10` fits whole datasets in `128GB` unified memory. `CPU` fallback is bit-exact (`Windows`-safe, no `Triton` needed).
 
 Chroma is choosable: `cache_images(..., chroma420=False)` forces `4:4:4` (default auto: `ultra`/`high` → `4:4:4`, below → `4:2:0`), `chroma420=True` forces `4:2:0`. Same flag on `PixelCacheWriter`. Forcing `4:4:4` on `balanced` = `+1.4dB` for `+16%` bytes (`38.7dB` `96x` vs `37.3dB` `112x`, COCO `336`).

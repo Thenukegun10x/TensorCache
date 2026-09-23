@@ -257,6 +257,34 @@ def test_cross_implementation_with_rust_reference():
     assert pos == len(blob), "trailing bytes in golden fixture"
 
 
+def test_no_numba_warns_loudly_once(monkeypatch):
+    """Missing numba must warn big and once, at encode and decode entry."""
+    import warnings as _w
+
+    import tensorcache.rans as rans
+    import tensorcache.tans as tans
+
+    monkeypatch.setattr(rans, "HAS_NUMBA", False)
+    monkeypatch.setattr(rans, "_NO_NUMBA_WARNED", False)
+    with pytest.warns(RuntimeWarning, match="PURE-PYTHON"):
+        rans.warn_if_no_numba("unit test")
+    # once per process: a second call is silent even under -W error
+    with _w.catch_warnings():
+        _w.simplefilter("error")
+        rans.warn_if_no_numba("again")
+
+    data = bytes([7] * 200 + [8] * 50)
+    monkeypatch.setattr(rans, "_NO_NUMBA_WARNED", True)
+    blob = rans.encode(data)  # pure-Python path, warning suppressed
+    monkeypatch.setattr(rans, "_NO_NUMBA_WARNED", False)
+    with pytest.warns(RuntimeWarning, match="50x slower"):
+        assert rans.decode(blob) == data
+
+    monkeypatch.setattr(rans, "_NO_NUMBA_WARNED", False)
+    with pytest.warns(RuntimeWarning, match="50x slower"):
+        tans.encode(data, block=128)
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

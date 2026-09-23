@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tcache"
-version = "0.6.2"
+version = "0.7.0"
 description = "Ultra-fast, high-fidelity block-wise INT8 feature & pixel cache engine for ML pipelines"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -17,10 +17,17 @@ authors = [
 keywords = ["pytorch", "gpu", "compression", "vit", "cnn", "caching", "int8", "quantization", "triton", "cuda", "rocm"]
 dependencies = [
     "torch>=2.0.0",
-    "numpy>=1.20.0"
+    "numpy>=1.20.0",
+    "pillow>=9.0.0"
 ]
 
 [project.optional-dependencies]
+# Fast entropy only (rANS/tANS hot loops). Much lighter than `fast` when you
+# don't need triton/blosc2/safetensors. Without numba the codecs fall back to
+# pure Python and are ~50x slower on the CPU.
+entropy = [
+    "numba>=0.57.0"
+]
 fast = [
     "triton>=2.0.0; platform_system != 'Windows'",
     "zstandard>=0.20.0",

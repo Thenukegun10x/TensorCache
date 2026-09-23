@@ -1079,8 +1079,14 @@ if HAS_TRITON:
         au8_list = [a["arena_u8"] for a in arenas]
         ai8_list = [a["arena_i8"] for a in arenas]
         ll4_list = [a["ll4"].to(torch.int16).reshape(-1) for a in arenas]
-        u8len = torch.tensor([a.numel() for a in au8_list], dtype=torch.int32)
-        i8len = torch.tensor([a.numel() for a in ai8_list], dtype=torch.int32)
+        # offsets/cumsums must live wherever the arena tensors do, so the
+        # meta fixup below works for CPU arenas (mmap path) and GPU-resident
+        # arenas (tANS entropy already decoded on device) alike.
+        adev = au8_list[0].device
+        u8len = torch.tensor([a.numel() for a in au8_list], dtype=torch.int32,
+                             device=adev)
+        i8len = torch.tensor([a.numel() for a in ai8_list], dtype=torch.int32,
+                             device=adev)
         OU = (u8len.cumsum(0) - u8len).view(N, 1, 1)
         OI = (i8len.cumsum(0) - i8len).view(N, 1, 1)
         meta = torch.stack([a["meta"] for a in arenas], dim=0)  # [N,P,8]

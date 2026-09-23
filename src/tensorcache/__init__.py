@@ -79,7 +79,7 @@ from .pixel_cache import (
 )
 from .streamer import ZeroCopyTensorStreamer
 
-__version__ = "0.6.2"
+__version__ = "0.7.0"
 __all__ = [
     "BlockwiseInt8Codec",
     "quantize_int8_g32",

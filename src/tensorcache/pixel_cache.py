@@ -45,7 +45,9 @@ class PixelCacheWriter:
         group_size: int = 32,
         xs_mode: str = "balanced",
         chroma420: Optional[bool] = None,
-        xs_entropy: bool = True,
+        xs_entropy: Union[bool, str] = True,
+        tans_dict: Optional[object] = None,
+        tans_block: int = 256,
     ):
         # Normalize quant args: quant="raw"/"int4"/"int3"/"xs" or quant_bits=8/4/3
         if quant_bits is not None:
@@ -69,7 +71,35 @@ class PixelCacheWriter:
         self.chroma420 = chroma420
         # rANS entropy coding for quant='xs' sections (u8/i8/ll4; meta stays
         # raw — measured loss). False writes the exact pre-0.6 v1 layout.
-        self.xs_entropy = bool(xs_entropy)
+        # "tans" selects the block-tANS research codec (dictionary-coded,
+        # GPU-decoded); it needs `tans_dict` and a CUDA/ROCm decode device.
+        if xs_entropy in (True, "rans"):
+            self.xs_entropy_mode = "rans"
+        elif xs_entropy in (False, None, "none"):
+            self.xs_entropy_mode = "none"
+        elif xs_entropy == "tans":
+            self.xs_entropy_mode = "tans"
+        else:
+            raise ValueError(
+                f"xs_entropy must be True/False/'tans', got {xs_entropy!r}")
+        # legacy-compatible meta value: True (rANS) / False (raw) / 'tans'
+        self.xs_entropy = (True if self.xs_entropy_mode == "rans"
+                           else False if self.xs_entropy_mode == "none"
+                           else "tans")
+        self._tans_tables = None
+        self._tans_R = 12
+        self._tans_K = 8
+        self._tans_block = int(tans_block)
+        if self.xs_entropy_mode == "tans":
+            if quant != "xs":
+                raise ValueError("xs_entropy='tans' requires quant='xs'")
+            from .tans_dict import coerce_dictionary
+            tables, R, K, _B = coerce_dictionary(tans_dict)
+            if K > 255:
+                raise ValueError(f"tANS dictionary K={K} exceeds the u8 selector")
+            self._tans_tables = tables
+            self._tans_R = int(R)
+            self._tans_K = int(K)
         self.quant_bits = 8 if quant in ("raw", "xs") else (4 if quant == "int4" else 3)
         self.output_prefix = Path(output_prefix)
         self.output_prefix.parent.mkdir(parents=True, exist_ok=True)
@@ -223,11 +253,21 @@ class PixelCacheWriter:
         #   ll4    — byte-planar (lo/hi planes rANS'd separately)
         #   meta   — stays raw: measured -1.4% (table cost > redundancy)
         enc = None
-        if self.xs_entropy:
+        if self.xs_entropy_mode == "rans":
             from .rans import pack_byte_planar, pack_section
             e0, u8 = pack_section(u8)
             e1, i8 = pack_section(i8)
             e3, l4 = pack_byte_planar(l4_raw)
+            enc = [e0, e1, 0, e3]
+        elif self.xs_entropy_mode == "tans":
+            from .tans import pack_byte_planar_tans, pack_section_tans
+            t, R, B = self._tans_tables, self._tans_R, self._tans_block
+            e0, u8 = pack_section_tans(u8, R=R, block=B, tables=t["u8"],
+                                       embed_tables=False)
+            e1, i8 = pack_section_tans(i8, R=R, block=B, tables=t["i8"],
+                                       embed_tables=False)
+            e3, l4 = pack_byte_planar_tans(l4_raw, t["ll4_lo"], t["ll4_hi"],
+                                           R=R, block=B)
             enc = [e0, e1, 0, e3]
         else:
             l4 = l4_raw
@@ -423,6 +463,11 @@ class PixelCacheWriter:
             meta["xs_mode"] = self.xs_mode
             meta["chroma420"] = self.chroma420
             meta["xs_entropy"] = self.xs_entropy
+            if self.xs_entropy_mode == "tans":
+                from .tans_dict import dictionary_to_meta
+                meta["tans"] = dictionary_to_meta(
+                    self._tans_tables, R=self._tans_R, K=self._tans_K,
+                    B=self._tans_block)
             meta["xs_files"] = {
                 "u8": os.path.basename(self.xs_u8_path),
                 "i8": os.path.basename(self.xs_i8_path),
@@ -463,10 +508,147 @@ class PixelCacheDataset(Dataset):
         self.quant_bits = self.meta.get("quant_bits", 8 if self.quant=="raw" else (4 if self.quant=="int4" else 3))
         self.group_size = self.meta.get("group_size", 32)
         self._xs = (self.quant == "xs")
+        # Section entropy mode: False (v1 raw), True (rANS), or "tans".
+        raw_ent = self.meta.get("xs_entropy", False)
+        self._entropy = "tans" if raw_ent == "tans" else (
+            True if raw_ent in (True, "rans") else False)
+        self._tans_tables = None
+        self._tans_R = None
+        self._tans_block = None
+        if self._entropy == "tans":
+            from .tans_dict import TANS_KINDS, dictionary_from_meta
+            tables, R, K, B = dictionary_from_meta(
+                self.meta["tans"], expected_kinds=TANS_KINDS)
+            self._tans_tables = tables
+            self._tans_R = R
+            self._tans_block = B
         if decode_device is None:
             decode_device = "cuda:0" if torch.cuda.is_available() else "cpu"
         self.decode_device = torch.device(decode_device)
         self._open_mmaps()
+
+    def _decode_section(self, stored, method: int, kind: str) -> np.ndarray:
+        """One stored section -> decoded array (raw / rANS / block-tANS)."""
+        if method == 0:
+            return np.array(stored)
+        if self._entropy == "tans":
+            from .tans import unpack_section_tans
+            return np.frombuffer(
+                unpack_section_tans(method, bytes(stored),
+                                    tables=self._tans_tables[kind]),
+                dtype=stored.dtype)
+        from .rans import unpack_section
+        return np.frombuffer(unpack_section(method, bytes(stored)),
+                             dtype=stored.dtype)
+
+    def _decode_ll4(self, stored, method: int) -> np.ndarray:
+        """ll4 stored bytes -> dense int16 (byte-planar wrapper or raw)."""
+        if not method:
+            return np.array(stored).view(np.int16)
+        if self._entropy == "tans":
+            from .tans import unpack_byte_planar_tans
+            return np.frombuffer(
+                unpack_byte_planar_tans(bytes(stored),
+                                        self._tans_tables["ll4_lo"],
+                                        self._tans_tables["ll4_hi"]),
+                dtype=np.int16)
+        from .rans import unpack_byte_planar
+        return np.frombuffer(unpack_byte_planar(1, bytes(stored)),
+                             dtype=np.int16)
+
+    def _stored_sections(self, idx: int) -> dict:
+        """Stored (still-coded) section bytes + meta rows for one sample."""
+        r = self.meta["xs_table"][idx]
+        enc = r.get("enc")
+        u8 = np.asarray(self._xs_u8[r["u8_off"]:r["u8_off"] + r["u8_len"]])
+        i8 = np.asarray(self._xs_i8[r["i8_off"]:r["i8_off"] + r["i8_len"]])
+        if enc:
+            l4 = np.asarray(self._xs_ll4[r["lb_off"]:r["lb_off"] + r["lb_len"]])
+        else:
+            l4 = np.asarray(self._xs_ll4[r["ll4_off"] * 2:
+                                         r["ll4_off"] * 2 + r["ll4_len"] * 2])
+        mt = np.array(self._xs_meta[r["meta_row"]:r["meta_row"] + r["n_planes"]])
+        return {"u8": u8.tobytes(), "i8": i8.tobytes(), "ll4": l4.tobytes(),
+                "enc": enc, "meta": mt}
+
+    def _decode_kind_gpu(self, items, kind: str, device) -> list:
+        """[(method, bytes)] -> [decoded uint8 arrays], one GPU plan per kind."""
+        from .tans import build_decode_plan, run_decode_plan
+        res = [None] * len(items)
+        coded = [(i, b) for i, (m, b) in enumerate(items) if m == 2]
+        for i, (m, b) in enumerate(items):
+            if m == 0:
+                res[i] = np.frombuffer(b, dtype=np.uint8)
+            elif m != 2:
+                raise ValueError(f"unexpected tANS section method {m}")
+        if coded:
+            plan = build_decode_plan([b for _, b in coded],
+                                     self._tans_tables[kind], self._tans_R,
+                                     self._tans_block, device)
+            flat = run_decode_plan(plan).cpu().numpy()
+            off = 0
+            for (i, _), n in zip(coded, plan["sizes"]):
+                res[i] = flat[off:off + n]
+                off += n
+        return res
+
+    def decode_arenas_tans(self, idxs, device=None) -> list:
+        """GPU-decode tANS sections for `idxs` -> arena dicts (device tensors).
+
+        The entropy decode happens on the GPU, so this must run in the main
+        process (not in DataLoader workers). Batches are decoded as one plan
+        per section kind.
+        """
+        from .tans import split_planar_section
+        if device is None:
+            device = self.decode_device
+        dev = torch.device(device)
+        from .tans_dict import require_tans_gpu_decode
+        require_tans_gpu_decode(dev)
+        stored = [self._stored_sections(i) for i in idxs]
+        u8_items = [(s["enc"][0] if s["enc"] else 0, s["u8"]) for s in stored]
+        i8_items = [(s["enc"][1] if s["enc"] else 0, s["i8"]) for s in stored]
+        u8s = self._decode_kind_gpu(u8_items, "u8", dev)
+        i8s = self._decode_kind_gpu(i8_items, "i8", dev)
+        lo_items, hi_items = [], []
+        for s in stored:
+            if s["enc"] and s["enc"][3]:
+                (m0, b0), (m1, b1) = split_planar_section(s["ll4"])
+            else:  # dense v1 layout: planes are the even/odd bytes
+                (m0, b0), (m1, b1) = (0, s["ll4"][0::2]), (0, s["ll4"][1::2])
+            lo_items.append((m0, b0))
+            hi_items.append((m1, b1))
+        los = self._decode_kind_gpu(lo_items, "ll4_lo", dev)
+        his = self._decode_kind_gpu(hi_items, "ll4_hi", dev)
+        sh = self._xs_shared
+        arenas = []
+        for j, s in enumerate(stored):
+            lo, hi = los[j], his[j]
+            if lo.size != hi.size:
+                raise ValueError(f"planar planes differ: {lo.size} vs {hi.size}")
+            ll4 = np.ascontiguousarray(
+                np.stack([lo, hi], axis=-1)).view(np.int16).reshape(-1)
+            arenas.append({
+                "format": "xs-arena-v1",
+                "adaptive": bool(sh["adaptive"]),
+                "orig_shape": tuple(sh["orig_shape"]),
+                "pad_h": int(sh["pad_h"]),
+                "pad_w": int(sh["pad_w"]),
+                "inv": self._xs_inv,
+                "B": int(sh["B"]),
+                "P": int(sh["P"]),
+                "arena_u8": torch.from_numpy(u8s[j].copy()).to(dev),
+                "arena_i8": torch.from_numpy(i8s[j].copy()).view(
+                    torch.int8).to(dev),
+                "meta": torch.from_numpy(s["meta"].copy()).to(dev),
+                "ll4": torch.from_numpy(ll4.copy()).to(dev),
+                "ll4_shapes": [tuple(x) for x in sh["ll4_shapes"]],
+                "codebook": self._xs_codebook,
+                "q_scale": sh.get("q_scale"),
+                "lamb": sh.get("lamb"),
+                "mode": sh.get("mode"),
+            })
+        return arenas
 
     def __getstate__(self):
         # Spawn-safe workers (Windows default): memmaps don't survive pickling
@@ -600,19 +782,16 @@ class PixelCacheDataset(Dataset):
         # Entropy-decode here (worker-side CPU front-end): the packed blob
         # below is byte-identical to the v1 layout, so IPC fan-in, split and
         # the GPU mega-kernel never change. Decoded sizes -> v1 semantics.
-        u8 = _xs_section(self._xs_u8[r["u8_off"]:r["u8_off"] + r["u8_len"]],
-                         enc[0] if enc else 0)
-        i8 = _xs_section(self._xs_i8[r["i8_off"]:r["i8_off"] + r["i8_len"]],
-                         enc[1] if enc else 0)
+        u8 = self._decode_section(
+            self._xs_u8[r["u8_off"]:r["u8_off"] + r["u8_len"]],
+            enc[0] if enc else 0, "u8")
+        i8 = self._decode_section(
+            self._xs_i8[r["i8_off"]:r["i8_off"] + r["i8_len"]],
+            enc[1] if enc else 0, "i8")
         mt = np.array(self._xs_meta[r["meta_row"]:r["meta_row"] + r["n_planes"]])
         if enc:
             stored_l4 = self._xs_ll4[r["lb_off"]:r["lb_off"] + r["lb_len"]]
-            if enc[3]:
-                from .rans import unpack_byte_planar
-                l4 = np.frombuffer(unpack_byte_planar(1, bytes(stored_l4)),
-                                   dtype=np.int16)
-            else:
-                l4 = np.array(stored_l4).view(np.int16)  # dense row, byte copy
+            l4 = self._decode_ll4(stored_l4, enc[3])
         else:
             # v1: dense int16 at logical element offsets (ll4 file is uint8)
             off = r["ll4_off"] * 2
@@ -770,6 +949,35 @@ class PixelCacheDataset(Dataset):
 _XS_IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
 
 
+def _learn_tans_dictionary(files, height, width, xs_mode, chroma420,
+                           K=8, R=12, block=256, calib=256, batch=32):
+    """Encode a calibration sample and learn the tANS section dictionaries.
+
+    `xs_entropy="tans"` is dictionary-coded, so a build needs a
+    representative sample before it can stream. This runs the batched
+    encoder over the first `calib` files (cost paid once per cache).
+    """
+    from .codec import (quantize_pixel_wavelet_adaptive_batched,
+                        sparse_pack_arena_batched, sparse_pack_meta_batched)
+    from .tans_dict import learn_dictionary_from_arenas
+    sel = files[:min(calib, len(files))]
+    if not sel:
+        raise ValueError("no images to calibrate a tANS dictionary from")
+    arenas = []
+    for s in range(0, len(sel), batch):
+        imgs = []
+        for f in sel[s:s + batch]:
+            with Image.open(f) as im:
+                im = im.convert("RGB").resize((width, height),
+                                              Image.Resampling.BILINEAR)
+                imgs.append(np.array(im, dtype=np.uint8))
+        t = torch.from_numpy(np.stack(imgs)).to(torch.uint8)
+        metas = quantize_pixel_wavelet_adaptive_batched(
+            t, mode=xs_mode, chroma420=chroma420)
+        arenas.extend(sparse_pack_arena_batched(sparse_pack_meta_batched(metas)))
+    return learn_dictionary_from_arenas(arenas, K=K, R=R, block=block)
+
+
 def cache_images(
     src: Union[str, Path],
     output_prefix: Union[str, Path],
@@ -781,12 +989,19 @@ def cache_images(
     exts=_XS_IMAGE_EXTS,
     limit: Optional[int] = None,
     log_every: int = 500,
-    xs_entropy: bool = True,
+    xs_entropy: Union[bool, str] = True,
+    tans_dict: Optional[object] = None,
+    tans_block: int = 256,
+    tans_calib: int = 256,
 ) -> dict:
     """One-liner: encode a directory of images into a PixelCache.
 
     tensorcache.cache_images("data/coco_val", "./cache/coco336")
     # -> {"num_samples": 5000, "bytes": ..., "ratio_vs_raw": 7.1, ...}
+
+    xs_entropy="tans" selects the block-tANS codec: a dictionary is learned
+    from the first `tans_calib` images (unless `tans_dict` is supplied), the
+    cache stores it in `_pixel_meta.json`, and reading requires GPU decode.
     """
     import time
     src = Path(src)
@@ -795,10 +1010,18 @@ def cache_images(
         files = files[:limit]
     if not files:
         raise ValueError(f"no images ({'/'.join(exts)}) found under {src}")
+    if xs_entropy == "tans" and tans_dict is None:
+        t0 = time.perf_counter()
+        tans_dict = _learn_tans_dictionary(
+            files, height, width, xs_mode, chroma420,
+            R=12, block=tans_block, calib=tans_calib)
+        print(f"  learned tANS dictionary from {min(tans_calib, len(files))} "
+              f"images in {time.perf_counter()-t0:.1f}s")
     t0 = time.perf_counter()
     writer = PixelCacheWriter(output_prefix, num_samples=len(files), height=height,
                               width=width, channels=3, quant=quant, xs_mode=xs_mode,
-                              chroma420=chroma420, xs_entropy=xs_entropy)
+                              chroma420=chroma420, xs_entropy=xs_entropy,
+                              tans_dict=tans_dict, tans_block=tans_block)
     for i, f in enumerate(files):
         writer.append_image(str(f))
         if (i + 1) % log_every == 0:
@@ -862,13 +1085,47 @@ def make_xs_loader(
         ds.close()
         raise ValueError("make_xs_loader requires quant='xs' (this cache is "
                          f"{ds.quant!r}; use a DataLoader over PixelCacheDataset directly)")
-    if num_workers == 0 and ds.meta.get("xs_entropy"):
+    if ds._entropy == "tans":
+        # The tANS entropy layer decodes on the GPU by design (CPU tANS is
+        # slower than rANS), so it must stay in the main process — no
+        # DataLoader workers, no CPU fallback.
+        from .tans_dict import require_tans_gpu_decode
+        if num_workers > 0:
+            ds.close()
+            raise ValueError(
+                "xs_entropy='tans' caches decode entropy on the GPU, so "
+                "make_xs_loader requires num_workers=0 (the main process does "
+                "entropy + wavelet decode).")
+        require_tans_gpu_decode(dev)
+        try:
+            from .fused_ops import dequantize_sparse_wavelet_batch_gpu
+            order = list(range(len(ds)))
+            if shuffle:
+                import random
+                random.shuffle(order)
+            for s in range(0, len(order), batch_size):
+                chunk = order[s:s + batch_size]
+                if drop_last and len(chunk) < batch_size:
+                    break
+                arenas = ds.decode_arenas_tans(chunk, device=dev)
+                yield dequantize_sparse_wavelet_batch_gpu(arenas, device=dev)
+        finally:
+            ds.close()
+        return
+    if ds._entropy is True and num_workers == 0:
         import warnings
         warnings.warn(
             "entropy-coded xs cache (rANS): fetch costs ~0.2-0.3 ms/sample on "
             "the main thread with num_workers=0, making the loader fetch-bound. "
             "Use num_workers>=4 to hide it behind GPU decode.",
             RuntimeWarning, stacklevel=2)
+    if ds._entropy is True:
+        # numba is optional (install must work where numba has no wheel), but
+        # without it the entropy decode drops to pure Python on the CPU and is
+        # ~50x slower — the loader becomes the bottleneck. Warn loudly at this
+        # API boundary, not just deep inside the codec.
+        from .rans import warn_if_no_numba
+        warn_if_no_numba("xs cache decode (CPU)")
     if num_workers > 0:
         # Worker-side batch fan-in (one packed tensor per batch over IPC);
         # main-side collate splits it back into arena views (zero copies).

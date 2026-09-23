@@ -27,6 +27,7 @@ comparisons in tests).
 from __future__ import annotations
 
 import struct
+import warnings
 from typing import List
 
 import numpy as np
@@ -48,6 +49,38 @@ except ImportError:  # pragma: no cover - numba is an optional accelerator
         return wrap
 
     njit = _njit
+
+
+# One-shot guard so the warning is loud but not spammy (once per process).
+_NO_NUMBA_WARNED = False
+
+
+def warn_if_no_numba(context: str = "entropy coding") -> None:
+    """Loud, once-per-process warning when the pure-Python codec is active.
+
+    numba is intentionally optional (`pip install tcache` must succeed on
+    Pythons where numba has no wheel yet), but the fallback is ~50x slower
+    on the CPU: ~15-70 ms/image instead of ~1 ms. That silently turns an
+    entropy-coded cache into the training bottleneck, so call this at every
+    entropy entry point (cache open, encode, decode).
+    """
+    global _NO_NUMBA_WARNED
+    if HAS_NUMBA or _NO_NUMBA_WARNED:
+        return
+    _NO_NUMBA_WARNED = True
+    warnings.warn(
+        "\n"
+        "======================================================================\n"
+        "TensorCache: numba is NOT installed.\n"
+        f"  {context} is falling back to the PURE-PYTHON CPU codec, which is\n"
+        "  ~50x slower (~15-70 ms/image instead of ~1 ms). An entropy-coded\n"
+        "  cache will be CPU-fetch bound and stall GPU training.\n"
+        "  Fix:  pip install 'tcache[fast]'   (or: pip install numba)\n"
+        "======================================================================",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+
 
 # Probability precision: quantized frequencies sum to 1 << SCALE_BITS.
 SCALE_BITS = 12
@@ -270,6 +303,7 @@ def encode(data: bytes) -> bytes:
 
     Deterministic and byte-identical to Texel's Rust `rans::encode`.
     """
+    warn_if_no_numba("rANS encode")
     # Histogram via numpy (C loop, GIL-free): the pure-Python byte loop was
     # ~74% of encode() even on the numba path. Same counts -> same bitstream.
     counts = np.bincount(np.frombuffer(data, dtype=np.uint8),
@@ -325,6 +359,7 @@ def decode(blob: bytes) -> bytes:
     Raises RansError on truncated or corrupt input — mirrors the Rust error
     cases exactly (never hangs, never panics).
     """
+    warn_if_no_numba("rANS decode")
     m = len(blob)
     if m < 4:
         raise RansError("truncated rans section")
