@@ -6,6 +6,8 @@ import pytest
 from tensorcache import tans
 from tensorcache.tans import TansError, decode, encode
 from tensorcache.tans_dict import (
+    MISSING_CODELENGTH,
+    codelengths,
     collect_block_hists,
     learn_dictionary,
     select_tables,
@@ -38,6 +40,37 @@ def test_learn_dictionary_shape_and_determinism():
     assert len(t1) == 4
     for f in t1:
         assert len(f) == 256 and sum(f) == 4096 and min(f) >= 1
+
+
+def test_codelengths_sparse_tables_stay_finite():
+    """Zero-frequency symbols must not produce log2(0)/nan cost rows.
+
+    Regression: `R - np.log2(f)` warned on f=0 and returned +inf, so the
+    `H @ L` matmul produced `0 * inf = nan` and `argmin` silently picked the
+    first nan (i.e. an unusable sparse table) instead of the best real one.
+    """
+    import warnings
+
+    sparse = [0] * 256
+    for s in range(8):
+        sparse[s] = 512  # 8 * 512 = 4096 = 2**12
+    dense = _toy_tables()[1]  # all 256 symbols present
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        L = codelengths(sparse, 12)
+        costs = np.zeros((2, 256), dtype=np.int64).astype(np.float64) @ np.stack(
+            [L, codelengths(dense, 12)], axis=1)
+
+    assert np.isfinite(L).all()
+    assert L[200] == MISSING_CODELENGTH  # symbol absent from the table
+    assert np.isfinite(costs).all()
+
+    # a block using a symbol the sparse table lacks picks the dense table
+    H = np.zeros((2, 256), dtype=np.int64)
+    H[0, 3] = 1000    # in sparse
+    H[1, 200] = 1000  # only in dense
+    assert select_tables(H, [sparse, dense], 12) == [0, 1]
 
 
 def test_select_picks_peaked_table():

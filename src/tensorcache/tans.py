@@ -735,16 +735,24 @@ def build_decode_plan(blobs, tables, R: int, block: int, device):
     pay_list, rows_by_g, poff, ooff = [], {}, 0, 0
     for sp in parts:
         nb, sels = sp["nblocks"], sp["sels"]
-        bl = np.array([(x + 7) // 8 for x in sp["bit_lens"]])
+        bl = np.array([(x + 7) // 8 for x in sp["bit_lens"]], dtype=np.int64)
         goff = np.zeros(nb, dtype=np.int64)
         acc = 0
-        it = np.argsort(np.asarray(sels), kind="stable") if nb else ()
-        for g in it:
-            goff[int(g)] = acc
-            acc += bl[int(g)]
+        if sels is None:
+            # K=1: no selector array, payload is plain block order and every
+            # block uses table 0 (mirrors the `decode` path's `codecs[0]`).
+            for b in range(nb):
+                goff[b] = acc
+                acc += int(bl[b])
+        else:
+            it = np.argsort(np.asarray(sels), kind="stable") if nb else ()
+            for g in it:
+                goff[int(g)] = acc
+                acc += int(bl[int(g)])
         for b in range(nb):
             n_b = min(sp["B"], sp["n"] - b * sp["B"])
-            rows_by_g.setdefault(int(sels[b]), []).append(
+            table = 0 if sels is None else int(sels[b])
+            rows_by_g.setdefault(table, []).append(
                 [poff + int(goff[b]), sp["bit_lens"][b], sp["finals"][b], n_b, ooff])
             ooff += n_b
         pay_list.append(np.frombuffer(sp["payload"], dtype=np.uint8))

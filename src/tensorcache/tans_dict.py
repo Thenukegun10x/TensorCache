@@ -21,18 +21,38 @@ import numpy as np
 from .tans import HAS_TRITON, R_DEFAULT, normalize
 
 
+# Finite stand-in for "this table cannot encode this symbol". Kept well below
+# float64 overflow even for million-count blocks: 256 * 1e6 * 1e9 = 2.5e17.
+# See `codelengths` for why +inf is unusable (0 * inf -> nan in the cost
+# matmul, which makes `argmin` silently return the first nan row).
+MISSING_CODELENGTH = 1e9
+
+
 def codelengths(freq: List[int], R: int) -> np.ndarray:
-    """Ideal codelength -log2(p) per symbol for one table (all freqs >= 1)."""
+    """Ideal codelength -log2(p) per symbol for one table.
+
+    Tables are allowed to be sparse: `_unpack_kind` (and hand-built tables)
+    leave freq 0 for symbols the table cannot encode. Those get a large
+    finite penalty instead of +inf, because `nb x 256 @ 256 x K` would turn
+    `0 * inf` into nan and `argmin` would then pick the first nan row. The
+    penalty is big enough that a table missing a symbol present in a block
+    is never preferred, but small enough to keep costs finite/deterministic
+    when no table can encode a block.
+    """
     f = np.asarray(freq, dtype=np.float64)
-    return R - np.log2(f)
+    L = np.full(f.shape, MISSING_CODELENGTH, dtype=np.float64)
+    used = f > 0
+    L[used] = R - np.log2(f[used])
+    return L
 
 
 def select_tables(H: "np.ndarray", freqs: List[List[int]], R: int) -> List[int]:
     """Per-block argmin cross-entropy table index. Deterministic (ties -> lowest).
 
     H: [nb x 256] block counts. Cost(block, table) = H . L_table, one matmul.
-    Laplace smoothing in learn_dictionary guarantees no zero freqs, so no
-    infinite costs ever occur.
+    Sparse tables (freq 0 for a symbol) cost `MISSING_CODELENGTH` for that
+    symbol, so a table is effectively ruled out when the block contains a
+    symbol it cannot encode.
     """
     L = np.stack([codelengths(f, R) for f in freqs], axis=1)  # [256 x K]
     costs = H.astype(np.float64) @ L

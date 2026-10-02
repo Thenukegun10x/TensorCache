@@ -237,6 +237,35 @@ def test_block_codec_direct():
         decode_block(pay[:-1] if pay else pay, blen, fin, len(syms), codec)
 
 
+@pytest.mark.skipif(not tans.HAS_TRITON, reason="needs Triton")
+def test_build_decode_plan_k1():
+    """K=1 blobs carry no selector array; the GPU plan must still decode.
+
+    Regression: `build_decode_plan` indexed `sels[b]` unconditionally and
+    crashed with `sels=None` (K=1), even though `decode` handled it.
+    """
+    import torch
+
+    from tensorcache.tans import build_decode_plan, run_decode_plan, split_section
+
+    if not torch.cuda.is_available():
+        pytest.skip("tANS GPU decode needs CUDA/ROCm")
+
+    tab = [0] * 256
+    for s in range(64):
+        tab[s] = 64  # 64 * 64 = 4096 = 2**12
+    data = bytes(range(64)) * 40  # > 1 block, every symbol encodable
+    blob = encode(data, tables=[tab], embed_tables=False)
+    sp = split_section(blob, tables=[tab])
+    assert sp["K"] == 1 and sp["sels"] is None and sp["nblocks"] > 1
+
+    plan = build_decode_plan([blob, blob], [tab], R_DEFAULT, B_DEFAULT,
+                             torch.device("cuda:0"))
+    assert plan["sizes"] == [len(data), len(data)]
+    out = run_decode_plan(plan).cpu().numpy().tobytes()
+    assert out == data + data
+
+
 def test_cross_version_stability():
     """Golden blobs pin encode() byte-for-byte (see gen_tans_goldens.py)."""
     from pathlib import Path
