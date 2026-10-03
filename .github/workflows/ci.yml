@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: pytest ${{ matrix.os }} py${{ matrix.python-version }}${{ matrix.extras && ' +fast' || '' }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.9", "3.13"]
+        include:
+          # triton installed on a driver-less host: exercises the "device
+          # string says CUDA, hardware says no" fallback paths (0.7.1 gate
+          # bug class) without needing a GPU runner.
+          - os: ubuntu-latest
+            python-version: "3.12"
+            extras: fast
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install CPU-only PyTorch
+        run: python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install tcache (dev${{ matrix.extras && ' + fast' || '' }})
+        run: pip install -e ".[dev${{ matrix.extras && ',fast' || '' }}]"
+
+      - name: pytest
+        run: python -m pytest -q
+
+  build:
+    name: build & twine check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install build tooling
+        run: python -m pip install --upgrade pip build twine
+
+      - name: Build wheel + sdist
+        run: python -m build
+
+      # Catches the hatchling>=1.32 Metadata 2.5 output that PyPI rejects.
+      - name: twine check
+        run: twine check dist/*
+
+      - name: Upload dists
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
