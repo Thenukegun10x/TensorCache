@@ -322,7 +322,12 @@ def tans_gpu_decode_available(device=None) -> bool:
     import torch
     dev = torch.device(device if device is not None else
                        ("cuda:0" if torch.cuda.is_available() else "cpu"))
-    return dev.type in ("cuda", "hip")
+    # Device *strings* parse without hardware: "cuda:0".type == "cuda" even
+    # on a driver-less box with CUDA wheels + triton installed. Verify the
+    # backend actually sees a device (torch.cuda covers ROCm/HIP too).
+    if dev.type in ("cuda", "hip"):
+        return torch.cuda.is_available()
+    return False
 
 
 def require_tans_gpu_decode(device=None) -> None:
