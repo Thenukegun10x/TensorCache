@@ -9,6 +9,8 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      PYPI_PUBLISH_ENABLED: ${{ secrets.PYPI_API_TOKEN != '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -26,12 +28,10 @@ jobs:
       - name: twine check
         run: twine check dist/*
 
-      # Runs only for published GitHub Releases; workflow_dispatch still
-      # exercises the build above without uploading anything.
-      # Requires the PYPI_API_TOKEN repository secret (or swap to OIDC
-      # trusted publishing and drop `password`).
+      # Automatic upload is optional. Without the repository secret, this
+      # validates the release artifacts and leaves publishing to Twine.
       - name: Publish to PyPI
-        if: github.event_name == 'release'
+        if: github.event_name == 'release' && env.PYPI_PUBLISH_ENABLED == 'true'
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           password: ${{ secrets.PYPI_API_TOKEN }}
