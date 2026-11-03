@@ -9,6 +9,8 @@ build/
 *.whl
 .venv/
 .venv-mdv6/
+/venv/
+/venv2/
 .pytest_cache/
 *.egg
 

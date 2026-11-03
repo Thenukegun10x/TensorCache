@@ -65,6 +65,10 @@ if HAS_TRITON:
         """
         Fused GPU quantizer: Zero intermediate memory allocations.
         """
+        if x.device.type not in ("cuda", "hip"):
+            from .codec import quantize_int8_g32
+            return quantize_int8_g32(x, group_size)
+
         orig_shape = x.shape
         numel = x.numel()
         
@@ -142,6 +146,15 @@ if HAS_TRITON:
         """
         Fused AMO-BQ quantizer (Triton, 1 pass). Falls back to PyTorch if no Triton/CUDA.
         """
+        if x.device.type not in ("cuda", "hip"):
+            from .codec import quantize_int8_amo_bq
+            num_candidates = 32 if num_candidates is None else num_candidates
+            lo = 0.95 if lo is None else lo
+            hi = 1.05 if hi is None else hi
+            return quantize_int8_amo_bq(
+                x, group_size=group_size, mode=mode,
+                num_candidates=num_candidates, lo=lo, hi=hi)
+
         # Resolve preset if mode given
         if mode is not None:
             from .codec import AMO_BQ_PRESETS
@@ -213,6 +226,11 @@ if HAS_TRITON:
         q_int8: torch.Tensor, scales: torch.Tensor, orig_shape: Tuple[int, ...], 
         group_size: int = 32, out_buffer: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
+        if q_int8.device.type not in ("cuda", "hip"):
+            from .codec import dequantize_int8_g32
+            return dequantize_int8_g32(
+                q_int8, scales, orig_shape, group_size, out_buffer)
+
         numel = q_int8.numel()
         if out_buffer is None:
             out_buffer = torch.empty(orig_shape, dtype=torch.bfloat16, device=q_int8.device)
@@ -262,6 +280,11 @@ if HAS_TRITON:
         q_packed: torch.Tensor, scales: torch.Tensor, orig_shape: Tuple[int, ...],
         group_size: int = 32, out_buffer: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
+        if q_packed.device.type not in ("cuda", "hip"):
+            from .codec import dequantize_int4_g32
+            return dequantize_int4_g32(
+                q_packed, scales, orig_shape, group_size, out_buffer)
+
         numel = math.prod(orig_shape)
         if out_buffer is None:
             out_buffer = torch.empty(orig_shape, dtype=torch.bfloat16, device=q_packed.device)
@@ -333,6 +356,11 @@ if HAS_TRITON:
         q_packed: torch.Tensor, scales: torch.Tensor, orig_shape: Tuple[int, ...],
         group_size: int = 32, out_buffer: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
+        if q_packed.device.type not in ("cuda", "hip"):
+            from .codec import dequantize_int3_g32
+            return dequantize_int3_g32(
+                q_packed, scales, orig_shape, group_size, out_buffer)
+
         numel = math.prod(orig_shape)
         if out_buffer is None:
             out_buffer = torch.empty(orig_shape, dtype=torch.bfloat16, device=q_packed.device)
@@ -491,6 +519,11 @@ if HAS_TRITON:
         Falls back to batched PyTorch if Triton launch fails.
         """
         dev = torch.device(device)
+        if dev.type not in ("cuda", "hip"):
+            from .codec import dequantize_pixel_wavelet8x
+            return dequantize_pixel_wavelet8x(
+                packed_meta, device=dev, out_buffer=out_buffer)
+
         channels_data = packed_meta['channels']
         H, W, C = packed_meta['orig_shape']
         # Fast path: use batched stacks then Triton per-plane synthesis
@@ -1055,6 +1088,24 @@ if HAS_TRITON:
         from .codec import ADAPTIVE_CODEBOOK
         dev = torch.device(device)
         assert len(arenas) >= 1, "empty batch"
+        if dev.type not in ("cuda", "hip"):
+            from .codec import (
+                arena_to_sparse, dequantize_pixel_wavelet8x,
+                dequantize_pixel_wavelet_adaptive, sparse_unpack_meta,
+            )
+            outs = []
+            for arena in arenas:
+                sparse = (arena_to_sparse(arena)
+                          if arena.get("format") == "xs-arena-v1" else arena)
+                dense = sparse_unpack_meta(sparse)
+                if sparse.get("adaptive", False):
+                    outs.append(dequantize_pixel_wavelet_adaptive(
+                        dense, device=dev))
+                else:
+                    outs.append(dequantize_pixel_wavelet8x(
+                        dense, device=dev))
+            return torch.stack(outs, dim=0)
+
         arenas = [_xs_ensure_arena(a) for a in arenas]
         a0 = arenas[0]
         N = len(arenas)
@@ -1168,6 +1219,11 @@ if HAS_TRITON:
         out_buffer: torch.Tensor | None = None,
     ) -> torch.Tensor:
         dev = torch.device(device)
+        if dev.type not in ("cuda", "hip"):
+            from .codec import dequantize_pixel_wavelet_adaptive
+            return dequantize_pixel_wavelet_adaptive(
+                packed_meta, device=dev, out_buffer=out_buffer)
+
         H, W, C = packed_meta['orig_shape']
         G = packed_meta.get('G', 32)
         from .codec import ADAPTIVE_CODEBOOK, _chroma_is_subsampled
@@ -1293,6 +1349,15 @@ if HAS_TRITON:
             x_2d = q_int8.view(-1, self.in_features)
             M, K = x_2d.shape
             N = self.out_features
+
+            if q_int8.device.type not in ("cuda", "hip"):
+                from .codec import dequantize_int8_g32
+                x_dequant = dequantize_int8_g32(
+                    x_2d, scales, x_2d.shape, self.group_size)
+                out = F.linear(x_dequant, self.weight, self.bias)
+                if len(orig_shape) == 0:
+                    return out
+                return out.view(*orig_shape, N)
             
             out = torch.empty((M, N), dtype=torch.bfloat16, device=q_int8.device)
             

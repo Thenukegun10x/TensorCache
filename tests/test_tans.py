@@ -50,6 +50,22 @@ def test_roundtrip_uniform():
     _roundtrip(bytes(i % 256 for i in range(1024)))
 
 
+def test_k1_sparse_referenced_table_roundtrip():
+    """A one-table dictionary has no selector bytes and supports sparse tables."""
+    from tensorcache.tans import split_section
+
+    table = [0] * 256
+    for sym in range(64):
+        table[sym] = 64  # sums to 2**12; the input uses only these symbols
+    data = bytes(range(64)) * 16
+    blob = encode(data, tables=[table], embed_tables=False, block=256)
+    parts = split_section(blob, tables=[table])
+
+    assert parts["K"] == 1
+    assert parts["sels"] is None
+    assert decode(blob, tables=[table]) == data
+
+
 def test_block_residues():
     data = bytes((i * 37 + 11) % 251 for i in range(5000))
     for b in (1, 2, 3, 7, 16, 511, 512, 513, 1024, 4096):
@@ -264,6 +280,22 @@ def test_build_decode_plan_k1():
     assert plan["sizes"] == [len(data), len(data)]
     out = run_decode_plan(plan).cpu().numpy().tobytes()
     assert out == data + data
+
+
+@pytest.mark.skipif(not tans.HAS_TRITON, reason="needs Triton")
+def test_build_decode_plan_rejects_cpu_device():
+    """A CPU-only decode request must fail before dispatching a Triton kernel."""
+    import torch
+
+    from tensorcache.tans import build_decode_plan
+
+    table = [0] * 256
+    for sym in range(64):
+        table[sym] = 64
+    blob = encode(bytes(range(64)) * 8, tables=[table],
+                  embed_tables=False, block=256)
+    with pytest.raises(RuntimeError, match="CUDA/ROCm"):
+        build_decode_plan([blob], [table], R_DEFAULT, 256, torch.device("cpu"))
 
 
 def test_cross_version_stability():

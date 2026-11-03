@@ -721,6 +721,9 @@ def build_decode_plan(blobs, tables, R: int, block: int, device):
     if not HAS_TRITON:
         raise RuntimeError("tANS GPU decode requires Triton + CUDA/ROCm")
     import torch
+    from .tans_dict import require_tans_gpu_decode
+
+    require_tans_gpu_decode(device)
 
     parts = [split_section(b, tables=tables) for b in blobs]
     for sp in parts:
@@ -780,13 +783,29 @@ def build_decode_plan(blobs, tables, R: int, block: int, device):
 
 def run_decode_plan(plan: dict) -> "torch.Tensor":
     """Steady-state GPU decode: kernel launches only (no parse, no H2D)."""
+    _require_triton_tensors("tANS GPU decode", plan["out"], plan["payload"])
     out = plan["out"]
     for meta, sym, nb_, base in plan["launches"]:
+        _require_triton_tensors("tANS GPU decode", meta, sym, nb_, base)
         _tans_unpack_kernel[(meta.shape[0] // 32,)](
             plan["payload"], meta, sym, nb_, base, out,
             NS=1 << plan["R"], BMAX=plan["block"],
             PAY_N=len(plan["payload"]), num_warps=1)
     return out
+
+
+def _require_triton_tensors(operation: str, *tensors) -> None:
+    """Fail clearly instead of letting Triton try to launch on CPU tensors."""
+    import torch
+
+    for tensor in tensors:
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"{operation} expects torch.Tensor arguments")
+        if tensor.device.type not in ("cuda", "hip") or not torch.cuda.is_available():
+            raise RuntimeError(f"{operation} requires CUDA/ROCm tensors; got {tensor.device}")
+    devices = {tensor.device for tensor in tensors}
+    if len(devices) > 1:
+        raise ValueError(f"{operation} tensors must share a device")
 
 
 def split_planar_section(stored: bytes):
@@ -1005,6 +1024,7 @@ def tans_unpack_group_gpu(payload, meta, sym, nb_, base, out,
     if not isinstance(meta, torch.Tensor):
         meta = torch.from_numpy(np.asarray(meta)).to(torch.int32)
     meta = meta.to(torch.int32)
+    _require_triton_tensors("tANS GPU decode", payload, meta, sym, nb_, base, out)
     pad = (-meta.shape[0]) % 32
     if pad:
         extra = torch.zeros((pad, 5), dtype=torch.int32, device=meta.device)
@@ -1026,6 +1046,9 @@ def tans_lengths_group_gpu(syms, sbase, nn, freq, enck, sflat, soff,
     if not HAS_TRITON:
         raise RuntimeError("tans GPU encode requires Triton + CUDA/ROCm")
     import torch
+
+    _require_triton_tensors(
+        "tANS GPU encode", syms, sbase, nn, freq, enck, sflat, soff, lens)
 
     M = int(sbase.shape[0])
     pad = (-M) % 32
@@ -1055,6 +1078,10 @@ def tans_pack_group_gpu(syms, sbase, nn, obyte, freq, enck, sflat, soff,
     if not HAS_TRITON:
         raise RuntimeError("tans GPU encode requires Triton + CUDA/ROCm")
     import torch
+
+    _require_triton_tensors(
+        "tANS GPU encode", syms, sbase, nn, obyte, freq, enck, sflat, soff,
+        out)
 
     M = int(sbase.shape[0])
     pad = (-M) % 32

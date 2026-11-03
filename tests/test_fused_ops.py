@@ -7,6 +7,7 @@ import torch
 import math
 from tensorcache.fused_ops import (
     quantize_fused_gpu,
+    quantize_amo_fused_gpu,
     dequantize_fused_gpu,
     dequantize_fused_int4_gpu,
     dequantize_fused_int3_gpu,
@@ -51,6 +52,76 @@ def _is_functional_gpu() -> bool:
 
 
 GPU_AVAILABLE = _is_functional_gpu()
+
+
+@pytest.mark.skipif(not HAS_TRITON, reason="regression requires Triton to be installed")
+def test_triton_installed_cpu_tensors_use_torch_fallbacks():
+    """Triton availability must not send CPU tensors to a GPU kernel."""
+    from tensorcache.codec import (
+        quantize_int4_g32, quantize_int8_g32, quantize_int3_g32,
+    )
+
+    x = torch.randn(64, dtype=torch.bfloat16)
+
+    q8, s8, shape = quantize_fused_gpu(x)
+    ref_q8, ref_s8, ref_shape = quantize_int8_g32(x)
+    assert torch.equal(q8, ref_q8)
+    assert torch.equal(s8, ref_s8)
+    assert shape == ref_shape
+    assert dequantize_fused_gpu(q8, s8, shape).device.type == "cpu"
+
+    q4, s4, shape4 = quantize_int4_g32(x)
+    assert dequantize_fused_int4_gpu(q4, s4, shape4).device.type == "cpu"
+    q3, s3, shape3 = quantize_int3_g32(x)
+    assert dequantize_fused_int3_gpu(q3, s3, shape3).device.type == "cpu"
+
+    q_amo, s_amo, zp_amo, shape_amo = quantize_amo_fused_gpu(x)
+    assert q_amo.device.type == s_amo.device.type == zp_amo.device.type == "cpu"
+    assert shape_amo == x.shape
+
+
+@pytest.mark.skipif(not HAS_TRITON, reason="regression requires Triton to be installed")
+def test_fused_dequant_linear_uses_cpu_path_with_triton_installed():
+    """The fused layer remains usable on CPU even if Triton imports successfully."""
+    from tensorcache.codec import dequantize_int8_g32, quantize_int8_g32
+
+    x = torch.randn(2, 32, dtype=torch.bfloat16)
+    q, scales, _ = quantize_int8_g32(x)
+    layer = FusedDequantLinear(in_features=32, out_features=8).cpu()
+
+    actual = layer(q.view(2, 32), scales)
+    reconstructed = dequantize_int8_g32(q, scales, x.shape)
+    expected = torch.nn.functional.linear(reconstructed, layer.weight, layer.bias)
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.skipif(not HAS_TRITON, reason="regression requires Triton to be installed")
+def test_wavelet_gpu_apis_dispatch_cpu_tensors_without_triton_launches():
+    from tensorcache.codec import (
+        dequantize_pixel_wavelet8x, dequantize_pixel_wavelet_adaptive,
+        quantize_pixel_wavelet8x, quantize_pixel_wavelet_adaptive,
+        sparse_pack_arena, sparse_pack_meta,
+    )
+    from tensorcache.fused_ops import (
+        dequantize_fused_wavelet_adaptive_gpu,
+        dequantize_sparse_wavelet_batch_gpu,
+    )
+
+    img = _natural_test_img(64, 64)
+    static, _ = quantize_pixel_wavelet8x(img, chroma420=True)
+    expected_static = dequantize_pixel_wavelet8x(static, device="cpu")
+    actual_static = dequantize_fused_wavelet8x_gpu(static, device="cpu")
+    assert torch.equal(actual_static, expected_static)
+
+    adaptive, _ = quantize_pixel_wavelet_adaptive(img, mode="balanced")
+    expected_adaptive = dequantize_pixel_wavelet_adaptive(adaptive, device="cpu")
+    actual_adaptive = dequantize_fused_wavelet_adaptive_gpu(
+        adaptive, device="cpu")
+    assert torch.equal(actual_adaptive, expected_adaptive)
+
+    arena = sparse_pack_arena(sparse_pack_meta(adaptive))
+    actual_batch = dequantize_sparse_wavelet_batch_gpu([arena], device="cpu")
+    assert torch.equal(actual_batch[0], expected_adaptive)
 
 
 @pytest.mark.skipif(not GPU_AVAILABLE, reason="Functional CUDA/ROCm GPU + Triton required for Triton kernels")
