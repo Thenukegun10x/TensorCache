@@ -703,6 +703,7 @@ AMO_BQ_PRESETS = {
     "balanced":  (32, 0.95, 1.05, "0.478% @ 13ms, sweet spot, -13.7% vs sym"),
     "accurate":  (48, 0.95, 1.10, "0.473% @ 49ms, best G32 accuracy, -14.6% vs sym"),
     "max":       (64, 0.85, 1.10, "0.468% @ 59ms, diminishing returns"),
+    "quality":   (64, 0.85, 1.10, "opt-in BF16-grid search, decoded-error scoring; G16 for higher fidelity"),
     # no-search baseline for reference (not a preset, handled via amo_lo=hi=1.0,N=1)
 }
 
@@ -715,6 +716,59 @@ def _resolve_amo_preset(mode: Optional[str], num_candidates: Optional[int], lo: 
     return preset_N if num_candidates is None else num_candidates, \
            preset_lo if lo is None else lo, \
            preset_hi if hi is None else hi
+
+
+def _amo_quality_codes(x: torch.Tensor, scales: torch.Tensor, zps: torch.Tensor):
+    """Nearest decoded BF16 values, including shifted rounding boundaries."""
+    rounded = (x / scales + zps).round()
+    q = rounded.clamp(0, 255)
+    rec = ((q - zps) * scales).to(torch.bfloat16).float()
+    error = (x - rec).square()
+    for delta in (-1, 1):
+        alt_q = (rounded + delta).clamp(0, 255)
+        alt_rec = ((alt_q - zps) * scales).to(torch.bfloat16).float()
+        alt_error = (x - alt_rec).square()
+        better = alt_error < error
+        q = torch.where(better, alt_q, q)
+        error = torch.minimum(error, alt_error)
+    return q, error
+
+
+def _quantize_amo_quality_torch(x: torch.Tensor, group_size: int):
+    """Portable quality encoder; enumerates up to 64 actual BF16 scales."""
+    shape, numel = x.shape, x.numel()
+    flat = x.flatten().float()
+    flat = F.pad(flat, (0, (-numel) % group_size))
+    blocks = flat.view(-1, group_size)
+    count = blocks.shape[0]
+    q_out = torch.empty_like(blocks, dtype=torch.uint8)
+    scales_out = torch.empty(count, dtype=torch.bfloat16, device=x.device)
+    zps_out = torch.empty(count, dtype=torch.uint8, device=x.device)
+    offsets = torch.arange(64, device=x.device)
+    # Bound temporary memory on CPU and when a GPU cannot use Triton.
+    for start in range(0, count, 1024):
+        xb = blocks[start:start + 1024]
+        finite = torch.isfinite(xb)
+        clean = torch.where(finite, xb, 0.0)
+        # UINT8 zero points require a range that includes zero, including for
+        # constant and one-sided blocks. Legacy presets retain their behavior.
+        lower = clean.amin(1).clamp(max=0)
+        upper = clean.amax(1).clamp(min=0)
+        scale0 = (upper / 255.0 - lower / 255.0).clamp(min=1e-8 / 255.0)
+        lo_bits = (scale0 * 0.85).to(torch.bfloat16).view(torch.int16).int()
+        hi_bits = (scale0 * 1.10).to(torch.bfloat16).view(torch.int16).int()
+        bits = torch.minimum(lo_bits[:, None] + offsets, hi_bits[:, None])
+        scales = bits.to(torch.int16).view(torch.bfloat16).float()
+        zps = (-lower[:, None] / scales).round().clamp(0, 255)
+        q, error = _amo_quality_codes(clean[:, None, :], scales[:, :, None], zps[:, :, None])
+        error = torch.where(finite[:, None, :], error, 0.0).sum(2)
+        best = error.argmin(1)
+        rows = torch.arange(xb.shape[0], device=x.device)
+        best_zp = zps[rows, best].to(torch.uint8)
+        q_out[start:start + xb.shape[0]] = torch.where(finite, q[rows, best].to(torch.uint8), best_zp[:, None])
+        scales_out[start:start + xb.shape[0]] = scales[rows, best].to(torch.bfloat16)
+        zps_out[start:start + xb.shape[0]] = best_zp
+    return q_out.flatten()[:numel], scales_out, zps_out, shape
 
 
 def quantize_int8_amo_bq(
@@ -746,10 +800,13 @@ def quantize_int8_amo_bq(
     Args:
         x: Input tensor FP32/BF16 any shape.
         group_size: Block size (default 32).
-        num_candidates: Candidates in [lo,hi] (default 48, ignored if mode set).
-        lo, hi: Multiplier range (default 0.85-1.10, ignored if mode set).
+        num_candidates: Candidates in [lo,hi] (default 32, ignored if mode set).
+        lo, hi: Multiplier range (default 0.95-1.05, ignored if mode set).
         mode: Preset "fast" (16,0.95-1.05), "balanced" (32,0.95-1.05),
-              "accurate" (48,0.95-1.10), "max" (64,0.85-1.10). Overrides N/lo/hi if set.
+              "accurate" (48,0.95-1.10), "max" (64,0.85-1.10), or
+              "quality" (up to 64 BF16 scales in 0.85-1.10, scoring decoded
+              BF16 values). Overrides N/lo/hi if set. Quality is opt-in; use
+              group_size=16 for higher fidelity at 8.57% more bytes than G32.
 
     Returns:
         q_uint8: Flat 1D uint8 tensor.
@@ -769,6 +826,9 @@ def quantize_int8_amo_bq(
             return quantize_amo_fused_gpu(x, group_size=group_size, mode=mode, num_candidates=num_candidates, lo=lo, hi=hi)
         except Exception:
             pass  # fall back to PyTorch chunked
+
+    if mode == "quality":
+        return _quantize_amo_quality_torch(x, group_size)
 
     orig_shape = x.shape
     x_flat = x.flatten().float()
@@ -914,7 +974,8 @@ class BlockwiseInt8Codec:
       - adaptive: quantize_int8_adaptive
       - amo_bq: quantize_int8_amo_bq (asym + MSE-optimal)
         presets via amo_mode: "fast" (16,0.95-1.05), "balanced" (32,0.95-1.05),
-        "accurate" (48,0.95-1.10), "max" (64,0.85-1.10)
+        "accurate" (48,0.95-1.10), "max" (64,0.85-1.10), and opt-in
+        "quality" (BF16-grid search with decoded-error scoring)
     """
     def __init__(self, group_size: int = 32, adaptive: bool = False, amo_bq: bool = False,
                  amo_lo: float = 0.95, amo_hi: float = 1.05, amo_candidates: int = 32,

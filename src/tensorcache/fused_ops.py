@@ -143,6 +143,70 @@ if HAS_TRITON:
         tl.store(zp_ptr + blocks, best_zp.to(tl.uint8), mask=blocks * GROUP_SIZE < n_elements)
 
 
+    @triton.jit
+    def _amo_quality_round(value):
+        # Clamp first to avoid overflowing integer conversions on tiny scales.
+        # Nearest-even matches torch.round on both CUDA and ROCm.
+        value = tl.clamp(value, 0.0, 255.0)
+        base = tl.floor(value)
+        fraction = value - base
+        increment = (fraction > 0.5) | ((fraction == 0.5) & ((base.to(tl.int32) & 1) != 0))
+        return base + increment.to(tl.float32)
+
+
+    @triton.jit
+    def _amo_quality_codes(vals, scales, zps):
+        rounded = _amo_quality_round(vals / scales + zps)
+        q = rounded
+        rec = ((q - zps) * scales).to(tl.bfloat16).to(tl.float32)
+        error = (vals - rec) * (vals - rec)
+        for i in tl.static_range(2):
+            alt_q = tl.clamp(rounded + (2 * i - 1), 0.0, 255.0)
+            alt_rec = ((alt_q - zps) * scales).to(tl.bfloat16).to(tl.float32)
+            alt_error = (vals - alt_rec) * (vals - alt_rec)
+            q = tl.where(alt_error < error, alt_q, q)
+            error = tl.minimum(error, alt_error)
+        return q, error
+
+
+    @triton.jit
+    def _fused_amo_quality_kernel(
+        x_ptr, q_ptr, scales_ptr, zp_ptr, n_elements,
+        GROUP_SIZE: tl.constexpr, BLOCKS_PER_PROGRAM: tl.constexpr,
+    ):
+        blocks = tl.program_id(0) * BLOCKS_PER_PROGRAM + tl.arange(0, BLOCKS_PER_PROGRAM)
+        offs = blocks[:, None] * GROUP_SIZE + tl.arange(0, GROUP_SIZE)[None, :]
+        vals = tl.load(x_ptr + offs, mask=offs < n_elements, other=0.0).to(tl.float32)
+        finite = tl.abs(vals) < float("inf")
+        vals = tl.where(finite, vals, 0.0)
+        lower = tl.minimum(tl.min(vals, 1), 0.0)
+        upper = tl.maximum(tl.max(vals, 1), 0.0)
+        scale0 = tl.maximum(upper / 255.0 - lower / 255.0, 1e-8 / 255.0)
+        lo_bits = (scale0 * 0.85).to(tl.bfloat16).to(tl.int16, bitcast=True).to(tl.int32)
+        hi_bits = (scale0 * 1.10).to(tl.bfloat16).to(tl.int16, bitcast=True).to(tl.int32)
+        best_s = lo_bits.to(tl.int16).to(tl.bfloat16, bitcast=True).to(tl.float32)
+        best_zp = _amo_quality_round(-lower / best_s)
+        best_error = tl.full((BLOCKS_PER_PROGRAM,), float("inf"), tl.float32)
+        # This interval spans at most 60 representable BF16 scales. A fixed
+        # upper bound keeps selection device-side without a host scalar read.
+        for candidate in range(64):
+            bits = tl.minimum(lo_bits + candidate, hi_bits)
+            scale = bits.to(tl.int16).to(tl.bfloat16, bitcast=True).to(tl.float32)
+            zp = _amo_quality_round(-lower / scale)
+            _, error = _amo_quality_codes(vals, scale[:, None], zp[:, None])
+            error = tl.sum(tl.where(finite, error, 0.0), 1)
+            better = error < best_error
+            best_s = tl.where(better, scale, best_s)
+            best_zp = tl.where(better, zp, best_zp)
+            best_error = tl.minimum(error, best_error)
+        q, _ = _amo_quality_codes(vals, best_s[:, None], best_zp[:, None])
+        q = tl.where(finite, q, best_zp[:, None]).to(tl.uint8)
+        tl.store(q_ptr + offs, q, mask=offs < n_elements)
+        valid = blocks * GROUP_SIZE < n_elements
+        tl.store(scales_ptr + blocks, best_s.to(tl.bfloat16), mask=valid)
+        tl.store(zp_ptr + blocks, best_zp.to(tl.uint8), mask=valid)
+
+
     def quantize_amo_fused_gpu(
         x: torch.Tensor,
         group_size: int = 32,
@@ -197,6 +261,13 @@ if HAS_TRITON:
         blocks_per_program = 32
         grid = (triton.cdiv(num_blocks, blocks_per_program),)
         if numel == 0:
+            return q_out, scales_out, zp_out, orig_shape
+        if mode == "quality":
+            _fused_amo_quality_kernel[grid](
+                x_flat, q_out, scales_out, zp_out, numel,
+                GROUP_SIZE=group_size, BLOCKS_PER_PROGRAM=blocks_per_program,
+                num_warps=2,
+            )
             return q_out, scales_out, zp_out, orig_shape
         _fused_amo_quant_kernel[grid](
             x_flat, q_out, scales_out, zp_out, numel,

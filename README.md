@@ -2,10 +2,17 @@
 
 **Ultra-fast, high-fidelity block-wise INT8 feature & pixel cache engine for PyTorch.**
 
-`pip install tcache` → `import tensorcache` or `import tcache` — `0.4.2` on [PyPI](https://pypi.org/project/tcache/).
+`pip install tcache` → `import tensorcache` or `import tcache` — [PyPI](https://pypi.org/project/tcache/).
+
+**New in 0.7.3: opt-in AMO-BQ `quality`.** Search the stored BF16 scales and
+score the actual decoded values; choose G16 for higher fidelity or G32 for the
+same storage cost as balanced. **G16 quality delivers 34.7% lower feature RMSE
+for 8.57% more cache bytes** on COCO/DINOv3 versus G32 balanced. See the
+[COCO feature comparison](#amo-bq-feature-fidelity-on-coco-validation).
+Install or upgrade with `pip install --upgrade tcache`.
 
 `tensorcache` eliminates two bottlenecks:
-1. **Feature Cache Bloat:** `AMO-BQ` asymmetric MSE-optimal `G32` `1.09B` `1.83x` vs BF16 `0.47%` `rel RMSE` (`sym 1.06B 0.54%`) — near `G16` floor `0.39%`.
+1. **Feature Cache Bloat:** AMO-BQ G32 stores `1.09375 B/value` (`1.83x` compression vs BF16). Opt-in `quality` G16 reaches **`0.3652%` relative RMSE** on COCO/DINOv3, versus `0.5594%` for G32 balanced, at `1.1875 B/value`.
 2. **JPEG/PNG CPU Decode:** Zero-copy `mmap` + `GPU` stream prefetch `>2,000 MB/s`, ring-buffer `6.8MB` `VRAM` `batch8 128x768`.
 3. **Training Throughput (v0.2.2):** `iter_batches` `27k samp/s` `17.7GB/s` `B128 446x768` `~8.3x` vs `v0.2.0` `3.1k`, `Streamer` `21k` `5.1ms` `double-buffered` `pinned + async H2D` (`low_vram` `128MB` `B128`), `sharded 8x` for `H100 DDP`.
 4. **Pixel Cache Tunable Wavelet XS (v0.3.0):** `CDF 5/3` `4-lvl` `RCT` `4:2:0` `batched [3,H,W]` `GPU Triton` `out_buffer`, `adaptive RDO 4b` `G32` `16-lvl codebook` `TCQ-lite` `subband gains` `sparse bitstream` `zero-block skip` `hier nibble masks` `tunable` `44dB 3.2x` <-> `33dB 13.6x` (`balanced 37dB 7.8x`, `static 34dB 11.5x` measured COCO val 336) `presets ultra/high/balanced/compress/ultra_comp` `q_scale 1-8 lamb 1-50`.
@@ -14,7 +21,7 @@
 
 ## 🚀 Key Features
 
-* **AMO-BQ (Asymmetric MSE-Optimal, G32):** `min-max + zp uint8 + 48×` clipping search `[0.95,1.10]` — `0.47%` `hetero 0.54%` vs `sym 0.74%` (`-26%`), `per-token 1.73%` (`cache\dtype_comparison.json`). Presets `fast/balanced/accurate/max`.
+* **AMO-BQ (Asymmetric MSE-Optimal):** UINT8 values + BF16 scales + UINT8 zero points. Presets `fast/balanced/accurate/max` plus opt-in **`quality`**, which searches actual BF16 scales and minimizes decoded BF16 error. Group size separately controls storage: G32 is `1.09375 B/value` (`1.83x` vs BF16); G16 is `1.1875 B/value` (`1.68x`, **8.57% more cache bytes**).
 * **Microsecond Dequant (v0.2.2 opt):** `Triton` `shift >>5` vs `div`, `autotune BLOCK 512/1024/2048` `stages 2/3` `163 GB/s` `5.4M` (`codec.py:22` `0.19ms` `10M` `26x` for `1024`), `FusedDequantLinear` `0` intermediate `fused_ops.py:119`. `NaN/Inf` isolated `0` poison `1e-8` scale.
 * **Training-Optimized Dataloader:** `iter_batches` `27k samp/s` `17.7GB/s` `B128` `4.5ms` (`8.3x` vs `3.1k`), `Streamer` `21.6k` `5.1ms` `double-buffered` `pinned` `async H2D` overlap `dequant`. `low_vram=True` `128MB` `B128` (`53 MB` `B32`) vs `256MB`.
 * **Big Data Sharded:** `Writer(num_shards=8)` `->` `feat_shard{i}_*.bin` `+` `feat_shards.json`, `Dataset/Streamer(rank, world_size)` `DDP` `H100 8x` `~5.8k` random `27k` contiguous. Single shard `num_shards=1` unchanged `100%` compat.
@@ -45,7 +52,7 @@ import torch, tensorcache as tc
 
 x = torch.randn(16,446,768, dtype=torch.bfloat16, device="cuda")
 
-# AMO-BQ presets: fast (16,0.95-1.05) 6.9ms 0.49%, balanced (32,0.95-1.05) 13ms 0.478% (default), accurate (48,0.95-1.10) 49ms 0.473%
+# AMO-BQ defaults: balanced, G32. Higher-fidelity quality mode is opt-in.
 q,s,zp,shape = tc.compress(x, mode="balanced")  # or "fast"/"accurate"/"max"/"sym"/"adaptive"
 rec = tc.decompress(q,s,shape,zp)               # <0.1ms BF16
 tc.benchmark_tensor(x)                          # rich table
@@ -57,6 +64,41 @@ tc.help()                                       # python help
 codec = tc.BlockwiseInt8Codec(group_size=32, amo_bq=True, amo_mode="balanced")
 print(codec) # G=32, amo_bq=balanced 1.0938B 1:1.83x
 ```
+
+### 1b. Opt-in higher-fidelity AMO-BQ
+
+`balanced` with G32 remains the default. Choose `quality` explicitly and use
+G16 for higher fidelity, or G32 for better accuracy at the default byte rate.
+
+```python
+q, scales, zp, shape = tc.compress(x, mode="quality", group_size=16)
+rec = tc.decompress(q, scales, shape, zp, group_size=16)
+
+codec = tc.BlockwiseInt8Codec(amo_bq=True, amo_mode="quality", group_size=16)
+tc.benchmark_tensor(x, group_size=16, include_quality=True)
+```
+
+Pass the same `group_size` to the low-level decoder. Disk caches store it and
+the selected mode in their metadata, so datasets and streamers read the right
+settings automatically. The UINT8/BF16/UINT8 layout and decode operation stay
+the same; quality spends more work when creating the cache.
+
+```python
+writer = tc.FeatureCacheWriter(
+    "./cache/dinov3_quality", num_samples=10000, seq_len=446, dim=768,
+    amo_bq=True, amo_mode="quality", group_size=16,
+)
+writer.append(x)
+writer.close()
+
+dataset = tc.FeatureCacheDataset("./cache/dinov3_quality")
+# Consume dataset, then release mmap handles:
+dataset.close()
+```
+
+CLI: `python -m tensorcache compress-demo --mode quality --group-size 16`.
+Add `--quality` to `tensorcache benchmark --group-size 16` to include the
+quality search; automatic mode selection also requires `include_quality=True`.
 
 ### 2. Feature Cache to Disk (mmap) - Training Optimized
 ```python
@@ -193,7 +235,46 @@ tensorcache --help
 
 ---
 
-## 📊 Benchmark (DINOv3 ViT-Base, 5.4M randn + RSNA hetero)
+## 📊 Feature Benchmarks
+
+### AMO-BQ feature fidelity on COCO validation
+
+**All 5,000 COCO val images, all 1,712,640,000 DINOv3 ViT-B/16 feature
+values**, 336×336 inputs, BF16 features, RTX 4050 Laptop GPU, batch size 16.
+Relative RMSE compares decoded BF16 features with the original BF16 features.
+
+| Mode | Group size | B/value | Compression vs BF16 | Relative RMSE | RMSE reduction vs default | Encode GPU ms | Decode GPU ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `balanced` (default) | 32 | 1.09375 | 1.83× | 0.5594% | — | 0.758 | 0.060 |
+| **`quality` (opt-in)** | **32** | **1.09375** | **1.83×** | **0.5202%** | **7.0%** | 3.447 | 0.062 |
+| `balanced` | 16 | 1.18750 | 1.68× | 0.4228% | 24.4% | 0.844 | 0.060 |
+| **`quality` (opt-in)** | **16** | **1.18750** | **1.68×** | **0.3652%** | **34.7%** | 3.486 | 0.062 |
+
+**Pick `quality`, G16 for higher fidelity:** about one-third less feature RMSE
+than the default, while retaining 1.68× compression versus BF16. Pick
+`quality`, G32 for better accuracy at the default storage size. The trade-off
+is more encoding work when building the cache; the decode operation is the
+same. Existing presets and G32 defaults retain their behavior.
+
+Times are median GPU latency per batch, with three timed repetitions per
+batch after warmup. Image loading, feature extraction, input transfer and
+compilation are excluded; decode reuses an output buffer. These measure the
+codec, not end-to-end training or file-to-GPU throughput. BF16 scale and
+zero-point overhead is included in B/value. G16 uses **8.57% more total cache
+bytes** than G32. Results depend on the feature distribution.
+
+```bash
+python benchmarks/bench_amo_quality.py --limit 5000 --repeats 3
+```
+
+[Method and validation](https://github.com/Thenukegun10x/TensorCache/blob/v0.7.3/research/amo-quality-results.md) ·
+[Full numeric results](https://github.com/Thenukegun10x/TensorCache/blob/v0.7.3/research/amo_quality_coco.json) ·
+[Opt-in examples](#1b-opt-in-higher-fidelity-amo-bq)
+
+### Historical comparison (5.4M randn + RSNA hetero)
+
+The older measurements below use different inputs and timing conditions;
+compare rows within a table.
 
 | Format | B/elem | vs BF16 | rel RMSE |Outlier 0.1%| Dequant |
 |---|:---:|---|:---:|:---:|---|

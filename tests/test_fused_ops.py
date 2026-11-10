@@ -87,7 +87,7 @@ def test_amo_custom_search_noncontiguous_input(num_candidates):
 
 
 @pytest.mark.skipif(not GPU_AVAILABLE, reason="Functional CUDA/ROCm GPU + Triton required")
-@pytest.mark.parametrize("mode", ["fast", "balanced", "accurate", "max"])
+@pytest.mark.parametrize("mode", ["fast", "balanced", "accurate", "max", "quality"])
 def test_amo_nonfinite_values_reconstruct_as_zero(mode):
     from tensorcache.codec import quantize_int8_amo_bq, dequantize_int8_amo_bq
 
@@ -108,7 +108,9 @@ def test_amo_nonfinite_values_reconstruct_as_zero(mode):
 
 
 @pytest.mark.skipif(not GPU_AVAILABLE, reason="Functional CUDA/ROCm GPU + Triton required")
-def test_amo_public_encoder_supports_cuda_graph_capture():
+@pytest.mark.parametrize("mode", ["balanced", "quality"])
+@pytest.mark.parametrize("group_size", [16, 32])
+def test_amo_public_encoder_supports_cuda_graph_capture(mode, group_size):
     """The public encode path must not read a finite-check scalar on the CPU."""
     from tensorcache.codec import quantize_int8_amo_bq
 
@@ -116,14 +118,14 @@ def test_amo_public_encoder_supports_cuda_graph_capture():
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        quantize_int8_amo_bq(x)
+        quantize_int8_amo_bq(x, mode=mode, group_size=group_size)
     torch.cuda.current_stream().wait_stream(stream)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        actual = quantize_int8_amo_bq(x)
+        actual = quantize_int8_amo_bq(x, mode=mode, group_size=group_size)
     x[0] = float("nan")
     graph.replay()
-    expected = quantize_int8_amo_bq(x)
+    expected = quantize_int8_amo_bq(x, mode=mode, group_size=group_size)
     for got, want in zip(actual[:3], expected[:3]):
         assert torch.equal(got, want)
 

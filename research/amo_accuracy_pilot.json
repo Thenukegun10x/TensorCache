@@ -1,0 +1,31 @@
+{
+  "images": 256,
+  "blocks_per_image": 256,
+  "blocks": 65536,
+  "elements": 2097152,
+  "gpu": "NVIDIA GeForce RTX 4050 Laptop GPU",
+  "checkpoint": "/home/conorm/.cache/huggingface/hub/models--timm--vit_base_patch16_dinov3.lvd1689m/snapshots/c6a5fb7d12bbd3cf3b0079253141c3332aaed7da/model.safetensors",
+  "relative_rmse_pct": {
+    "production_fast": 0.5652046810726574,
+    "production_balanced": 0.5549065628618555,
+    "production_accurate": 0.5458285490436212,
+    "production_max": 0.5495520428139576,
+    "stored_scale": 0.5223336238073586,
+    "decoded_score": 0.5222674013288268,
+    "zero_range": 0.5223336238073586,
+    "wire_grid": 0.5139554876990126,
+    "lattice_refine": 0.5137464878791997
+  },
+  "rmse_reduction_vs_balanced_pct": {
+    "production_fast": -1.8558292332479853,
+    "production_balanced": 0.0,
+    "production_accurate": 1.6359535867472186,
+    "production_max": 0.9649408398204273,
+    "stored_scale": 5.869986270572536,
+    "decoded_score": 5.8819202578352385,
+    "zero_range": 5.869986270572536,
+    "wire_grid": 7.379814531593077,
+    "lattice_refine": 7.417478497709274
+  },
+  "notes": "Research reference; sampled COCO/DINOv3 BF16 blocks, not a production speed benchmark. Cache format unchanged."
+}

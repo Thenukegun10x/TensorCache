@@ -29,8 +29,10 @@ def cmd_info(args):
         print("triton not available (CPU fallback active)")
     print("\nAMO-BQ presets (G32, 1.09375 B/elem, 1.83x vs BF16):")
     for k,(N,lo,hi,desc) in AMO_BQ_PRESETS.items():
-        print(f"  {k:8s} N={N:2d} [{lo:.2f},{hi:.2f}]  {desc}")
-    print("\nSym G32 1.0625 B 1.88x vs BF16 0.54%, G16 1.1875 B 0.39%")
+        search = f"up to {N} BF16 scales" if k == "quality" else f"N={N:2d}"
+        print(f"  {k:8s} {search} [{lo:.2f},{hi:.2f}]  {desc}")
+    print("  Opt-in higher fidelity: --mode quality --group-size 16 (8.57% more bytes than G32)")
+    print("\nSym G32 1.0625 B 1.88x vs BF16; AMO G16 1.1875 B 1.68x vs BF16")
     print("\nQuant guidance:")
     print("  Features (fragile, need <2% RMSE): INT8 G32 0.70% 1.88x or AMO 0.47% 1.83x, INT7 G32 1.35% 2.13x max sub-2%")
     print("    INT4/INT3 for features blocked (12%/28% >>2% collapse) -> use INT8/INT7 only")
@@ -50,7 +52,8 @@ def cmd_benchmark(args):
     torch.manual_seed(42)
     print(f"Benchmark {shape} device={device} group_size={args.group_size}")
     x=torch.randn(shape, dtype=torch.bfloat16, device=device)
-    benchmark_tensor(x, group_size=args.group_size, device=None, verbose=True)
+    benchmark_tensor(x, group_size=args.group_size, device=None, verbose=True,
+                     include_quality=args.quality)
     est=estimate_compression(shape, args.group_size, amo_bq=True)
     print(f"\nEstimate: {est['total_MB']:.2f} MB total, {est['bytes_per_elem']:.4f} B/elem, ratio vs BF16 {est['ratio_vs_bf16']:.2f}x")
 
@@ -126,6 +129,7 @@ def build_parser():
     pb.add_argument("--shape", default="16,446,768", help="comma shape e.g. 16,446,768 (default: %(default)s)")
     pb.add_argument("--device", default="cuda", choices=["cuda","cpu"], help="device for bench (default: %(default)s)")
     pb.add_argument("--group-size", type=int, default=32, dest="group_size", help="group size G (default: %(default)s) - 32 for 1.88x 0.70%%, 16 for 0.39%%")
+    pb.add_argument("--quality", action="store_true", help="also benchmark the opt-in BF16-grid quality mode")
     pb.set_defaults(func=cmd_benchmark)
 
     pc=sub.add_parser("cache-info", help="inspect cache prefix meta (_meta.json / _pixel_meta.json)")
@@ -134,7 +138,7 @@ def build_parser():
     pc.set_defaults(func=cmd_cache_info)
 
     pd=sub.add_parser("compress-demo", help="demo AMO-BQ compress on synthetic data")
-    pd.description = "Demo compress/decompress with AMO-BQ presets (fast/balanced/accurate/max) or sym/adaptive."
+    pd.description = "Demo compress/decompress with AMO-BQ presets (fast/balanced/accurate/max/quality) or sym/adaptive."
     pd.add_argument("--shape", default="4,197,768", help="tensor shape (default: %(default)s)")
     pd.add_argument("--device", default="cuda", choices=["cuda","cpu"], help="device")
     pd.add_argument("--mode", default="balanced", choices=list(AMO_BQ_PRESETS.keys())+["sym","adaptive"], help="AMO preset or sym/adaptive (default: %(default)s)")

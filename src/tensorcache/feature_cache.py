@@ -15,7 +15,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from .codec import BlockwiseInt8Codec, dequantize_int8_g32, dequantize_int8_amo_bq
+from .codec import AMO_BQ_PRESETS, BlockwiseInt8Codec, dequantize_int8_g32, dequantize_int8_amo_bq
 
 
 class FeatureCacheWriter:
@@ -47,7 +47,7 @@ class FeatureCacheWriter:
         self.seq_len = seq_len
         if group_size <=0:
             raise ValueError(f"group_size must be >0, got {group_size}")
-        if amo_bq and amo_mode and amo_mode not in ("fast","balanced","accurate","max"):
+        if amo_bq and amo_mode and amo_mode not in AMO_BQ_PRESETS:
             raise ValueError(f"amo_mode {amo_mode!r} unknown")
         if adaptive and amo_bq:
             raise ValueError("Pick one: adaptive or amo_bq")
@@ -63,7 +63,6 @@ class FeatureCacheWriter:
         self.quant_bits = quant_bits
         # Resolve preset for meta storage
         if amo_mode is not None:
-            from .codec import AMO_BQ_PRESETS
             if amo_mode not in AMO_BQ_PRESETS:
                 raise ValueError(f"Unknown amo_mode {amo_mode!r}, choose from {list(AMO_BQ_PRESETS.keys())}")
             n, lo, hi, _ = AMO_BQ_PRESETS[amo_mode]

@@ -49,8 +49,9 @@ def benchmark_tensor(
     group_size: int = 32,
     device: Optional[str] = None,
     verbose: bool = True,
+    include_quality: bool = False,
 ) -> Dict[str, Any]:
-    """Quick error/latency benchmark for all modes on one tensor."""
+    """Quick error/latency benchmark; include_quality opts into BF16-grid search."""
     import time
     if device:
         x = x.to(device)
@@ -69,7 +70,10 @@ def benchmark_tensor(
         rel=(torch.norm(x.float()-rec.float())/torch.norm(x.float())).item()*100
         results[name]= {"rel_rmse%": rel, "ms": dt}
 
-    for mode in ["fast","balanced","accurate"]:
+    modes = ["fast", "balanced", "accurate", "max"]
+    if include_quality:
+        modes.append("quality")
+    for mode in modes:
         t0=time.perf_counter()
         q,s,zp,sh=quantize_int8_amo_bq(x, group_size, mode=mode)
         if x.is_cuda:
@@ -88,11 +92,13 @@ def benchmark_tensor(
             tbl.add_column("Mode"); tbl.add_column("rel RMSE%"); tbl.add_column("ms"); tbl.add_column("B/elem")
             for k,v in results.items():
                 bpe = 1+3/group_size if "amo" in k else 1+2/group_size
-                tbl.add_row(k, f"{v['rel_rmse%']:.4f}", f"{v['ms']:.2f}", f"{bpe:.4f}")
+                label = f"sym_g{group_size}" if k == "sym_g32" else k
+                tbl.add_row(label, f"{v['rel_rmse%']:.4f}", f"{v['ms']:.2f}", f"{bpe:.4f}")
             console.print(tbl)
         except Exception:
             for k,v in results.items():
-                print(f"{k:12s} rel={v['rel_rmse%']:.4f}% ms={v['ms']:.2f}")
+                label = f"sym_g{group_size}" if k == "sym_g32" else k
+                print(f"{label:12s} rel={v['rel_rmse%']:.4f}% ms={v['ms']:.2f}")
     return results
 
 
@@ -100,16 +106,20 @@ def auto_select_mode(
     x: torch.Tensor,
     target_rmse: float = 0.5,
     group_size: int = 32,
+    include_quality: bool = False,
 ) -> str:
-    """Pick cheapest AMO-BQ preset meeting target_rmse (else 'max' or G16)."""
-    res=benchmark_tensor(x, group_size, verbose=False)
-    for mode in ["fast","balanced","accurate","max"]:
+    """Pick a preset meeting target_rmse; quality search requires explicit opt-in."""
+    res=benchmark_tensor(x, group_size, verbose=False, include_quality=include_quality)
+    modes = ["fast", "balanced", "accurate", "max"]
+    if include_quality:
+        modes.append("quality")
+    for mode in modes:
         if res[f"amo_{mode}"]["rel_rmse%"] <= target_rmse:
             return mode
     # If still > target, suggest smaller G
     if group_size>16:
-        return f"G16_{auto_select_mode(x, target_rmse, 16)}"
-    return "max"
+        return f"G16_{auto_select_mode(x, target_rmse, 16, include_quality)}"
+    return "quality" if include_quality else "max"
 
 
 def compress(
@@ -117,7 +127,7 @@ def compress(
     mode: str = "balanced",
     group_size: int = 32,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Tuple[int,...]]:
-    """One-liner: amo_bq compress. Returns (q,s,zp,shape)."""
+    """AMO-BQ compress, returning (q,s,zp,shape). Opt into quality with mode='quality'."""
     if mode in AMO_BQ_PRESETS:
         return quantize_int8_amo_bq(x, group_size, mode=mode)
     elif mode in ("sym","adaptive"):
@@ -150,9 +160,11 @@ Python:
   import tensorcache as tc, torch
   x = torch.randn(16,446,768, dtype=torch.bfloat16, device='cuda')
   # 1. Codec one-liners
-  q,s,zp,shape = tc.compress(x, mode='balanced')  # fast/balanced/accurate/max/sym/adaptive
+  q,s,zp,shape = tc.compress(x, mode='balanced')  # fast/balanced/accurate/max/quality/sym/adaptive
+  # Opt-in higher fidelity: tc.compress(x, mode='quality', group_size=16)
+  # Pass group_size=16 to tc.decompress as well.
   rec = tc.decompress(q,s,shape,zp)               # BF16
-  tc.benchmark_tensor(x)                          # compare all modes
+  tc.benchmark_tensor(x)                          # add include_quality=True for quality
   tc.estimate_compression(x.shape)                # bytes / ratio
   tc.auto_select_mode(x, target_rmse=0.5)         # -> 'balanced'
 
@@ -171,9 +183,10 @@ CLI:
   python -m tensorcache cache-info --prefix ./cache/feat
   tensorcache --help
 
-Presets G32: fast (16,0.95-1.05) 6.9ms 0.49%, balanced (32,0.95-1.05) 13ms 0.478%, accurate (48,0.95-1.10) 49ms 0.473%
+Presets G32: fast (16 candidates), balanced (32), accurate (48), max (64).
+Opt-in quality: up to 64 actual BF16 scales in [0.85,1.10], scored after BF16 decode.
 Storage: amo 1.09375 B/elem 1.83x vs BF16 (+0.03 vs sym 1.0625), dequant 0.06ms 5.4M
-G16 0.39% 1.1875B 1.68x for <0.4% needs.
+G16: 1.1875B 1.68x (+8.57% bytes vs G32); combine with quality for higher fidelity.
 
 XS wavelet image cache (own 5/3 + RCT + 4:2:0 + RDO codec, GPU decode):
   tc.cache_images("data/coco_val", "./cache/coco336")  # one-liner build
