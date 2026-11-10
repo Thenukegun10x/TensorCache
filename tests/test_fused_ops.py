@@ -54,6 +54,80 @@ def _is_functional_gpu() -> bool:
 GPU_AVAILABLE = _is_functional_gpu()
 
 
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Functional CUDA/ROCm GPU + Triton required")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("group_size", [16, 32, 64])
+@pytest.mark.parametrize("numel", [0, 1, 31, 32, 65, 1024])
+def test_amo_direct_load_matches_fp32_padded_input(dtype, group_size, numel):
+    """Direct low-precision loads and masked tails preserve encoded bytes."""
+    torch.manual_seed(7)
+    x = torch.randn(numel, device="cuda", dtype=dtype)
+    actual = quantize_amo_fused_gpu(x, group_size=group_size)
+    padded = torch.nn.functional.pad(x.float(), (0, (-numel) % group_size))
+    expected = quantize_amo_fused_gpu(padded, group_size=group_size)
+    assert torch.equal(actual[0], expected[0][:numel])
+    assert torch.equal(actual[1], expected[1])
+    assert torch.equal(actual[2], expected[2])
+    assert actual[3] == x.shape
+
+
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Functional CUDA/ROCm GPU + Triton required")
+@pytest.mark.parametrize("num_candidates", [1, 7])
+def test_amo_custom_search_noncontiguous_input(num_candidates):
+    from tensorcache.codec import dequantize_int8_amo_bq
+
+    torch.manual_seed(27)
+    x = torch.randn(33, 65, device="cuda", dtype=torch.bfloat16).t()
+    result = quantize_amo_fused_gpu(
+        x, mode=None, num_candidates=num_candidates, lo=1.0, hi=1.05)
+    rec = dequantize_int8_amo_bq(*result)
+    assert result[3] == x.shape
+    assert rec.shape == x.shape
+    assert torch.norm(x.float() - rec.float()) / torch.norm(x.float()) < 0.01
+
+
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Functional CUDA/ROCm GPU + Triton required")
+@pytest.mark.parametrize("mode", ["fast", "balanced", "accurate", "max"])
+def test_amo_nonfinite_values_reconstruct_as_zero(mode):
+    from tensorcache.codec import quantize_int8_amo_bq, dequantize_int8_amo_bq
+
+    torch.manual_seed(17)
+    x = torch.randn(1027, device="cuda", dtype=torch.bfloat16)
+    x[0] = float("nan")
+    x[32:64] = float("inf")
+    x[128] = -float("inf")
+    x[-1] = float("nan")
+    q, scales, zp, shape = quantize_int8_amo_bq(x, mode=mode)
+    rec = dequantize_int8_amo_bq(q, scales, zp, shape)
+    finite = torch.isfinite(x)
+    assert torch.isfinite(scales).all()
+    assert torch.isfinite(rec).all()
+    assert torch.count_nonzero(rec[~finite]) == 0
+    rel_rmse = torch.norm(x[finite].float() - rec[finite].float()) / torch.norm(x[finite].float())
+    assert rel_rmse < 0.01
+
+
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="Functional CUDA/ROCm GPU + Triton required")
+def test_amo_public_encoder_supports_cuda_graph_capture():
+    """The public encode path must not read a finite-check scalar on the CPU."""
+    from tensorcache.codec import quantize_int8_amo_bq
+
+    x = torch.randn(1024, device="cuda", dtype=torch.bfloat16)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        quantize_int8_amo_bq(x)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = quantize_int8_amo_bq(x)
+    x[0] = float("nan")
+    graph.replay()
+    expected = quantize_int8_amo_bq(x)
+    for got, want in zip(actual[:3], expected[:3]):
+        assert torch.equal(got, want)
+
+
 @pytest.mark.skipif(not HAS_TRITON, reason="regression requires Triton to be installed")
 def test_triton_installed_cpu_tensors_use_torch_fallbacks():
     """Triton availability must not send CPU tensors to a GPU kernel."""

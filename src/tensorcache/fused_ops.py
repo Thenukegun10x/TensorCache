@@ -99,19 +99,24 @@ if HAS_TRITON:
         NUM_CANDIDATES: tl.constexpr,
         LO: tl.constexpr,
         HI: tl.constexpr,
+        BLOCKS_PER_PROGRAM: tl.constexpr,
     ):
-        pid = tl.program_id(axis=0)
-        offs = pid * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+        blocks = tl.program_id(axis=0) * BLOCKS_PER_PROGRAM + tl.arange(0, BLOCKS_PER_PROGRAM)
+        offs = blocks[:, None] * GROUP_SIZE + tl.arange(0, GROUP_SIZE)[None, :]
         mask = offs < n_elements
         vals = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
 
-        # Per-block min/max (padded ensures full blocks)
-        b_min = tl.min(vals, axis=0)
-        b_max = tl.max(vals, axis=0)
+        # Match the PyTorch fallback: non-finite values contribute zero to
+        # statistics, are excluded from the error, and reconstruct as zero.
+        is_finite = tl.abs(vals) < float("inf")
+        vals = tl.where(is_finite, vals, 0.0)
+        b_min = tl.min(vals, axis=1)
+        b_max = tl.max(vals, axis=1)
         b_range = tl.maximum(b_max - b_min, 1e-8)
+        b_range = tl.where(b_range < float("inf"), b_range, 1e-8)
         s0 = b_range / 255.0
 
-        best_err = 3.4e38
+        best_err = tl.full((BLOCKS_PER_PROGRAM,), 3.4e38, tl.float32)
         best_s = s0 * LO
         best_zp = tl.clamp(tl.where(-b_min / best_s >= 0, -b_min / best_s + 0.5, -b_min / best_s - 0.5).to(tl.int32).to(tl.float32), 0.0, 255.0)
 
@@ -120,19 +125,22 @@ if HAS_TRITON:
             s_c = s0 * m
             inv = -b_min / s_c
             zp_c = tl.clamp(tl.where(inv >= 0, inv + 0.5, inv - 0.5).to(tl.int32).to(tl.float32), 0.0, 255.0)
-            q_c = tl.clamp(tl.where(vals / s_c + zp_c >= 0, vals / s_c + zp_c + 0.5, vals / s_c + zp_c - 0.5).to(tl.int32).to(tl.float32), 0.0, 255.0)
-            rec = (q_c - zp_c) * s_c
-            diff = vals - rec
-            err = tl.sum(diff * diff, axis=0)
+            scaled = vals / s_c[:, None] + zp_c[:, None]
+            q_c = tl.clamp(tl.where(scaled >= 0, scaled + 0.5, scaled - 0.5).to(tl.int32).to(tl.float32), 0.0, 255.0)
+            rec = (q_c - zp_c[:, None]) * s_c[:, None]
+            diff = tl.where(is_finite, vals - rec, 0.0)
+            err = tl.sum(diff * diff, axis=1)
             is_better = err < best_err
             best_err = tl.where(is_better, err, best_err)
             best_s = tl.where(is_better, s_c, best_s)
             best_zp = tl.where(is_better, zp_c, best_zp)
 
-        q_final = tl.clamp(tl.where(vals / best_s + best_zp >= 0, vals / best_s + best_zp + 0.5, vals / best_s + best_zp - 0.5).to(tl.int32).to(tl.float32), 0.0, 255.0).to(tl.uint8)
+        scaled = vals / best_s[:, None] + best_zp[:, None]
+        q_final = tl.clamp(tl.where(scaled >= 0, scaled + 0.5, scaled - 0.5).to(tl.int32).to(tl.float32), 0.0, 255.0).to(tl.uint8)
+        q_final = tl.where(is_finite, q_final, best_zp[:, None].to(tl.uint8))
         tl.store(q_ptr + offs, q_final, mask=mask)
-        tl.store(scales_ptr + pid, best_s.to(tl.bfloat16))
-        tl.store(zp_ptr + pid, best_zp.to(tl.uint8))
+        tl.store(scales_ptr + blocks, best_s.to(tl.bfloat16), mask=blocks * GROUP_SIZE < n_elements)
+        tl.store(zp_ptr + blocks, best_zp.to(tl.uint8), mask=blocks * GROUP_SIZE < n_elements)
 
 
     def quantize_amo_fused_gpu(
@@ -174,32 +182,32 @@ if HAS_TRITON:
 
         orig_shape = x.shape
         numel = x.numel()
-        pad_len = (group_size - (numel % group_size)) % group_size
-        if pad_len > 0:
-            x_flat = F.pad(x.flatten(), (0, pad_len))
-        else:
-            x_flat = x.flatten().contiguous()
-
-        # Ensure float32 for Triton (bf16 loads as float32)
-        if x_flat.dtype != torch.float32:
-            x_flat = x_flat.float()
-        # Triton expects contiguous
-        x_flat = x_flat.contiguous()
-
-        num_blocks = x_flat.numel() // group_size
-        q_out = torch.empty(x_flat.shape[0], dtype=torch.uint8, device=x.device)
+        # Load BF16/FP16 directly and cast in registers. Masked loads supply
+        # padding zeros without allocating a padded or FP32 input tensor.
+        x_flat = x.flatten().contiguous()
+        num_blocks = triton.cdiv(numel, group_size)
+        q_out = torch.empty(numel, dtype=torch.uint8, device=x.device)
         scales_out = torch.empty(num_blocks, dtype=torch.bfloat16, device=x.device)
         zp_out = torch.empty(num_blocks, dtype=torch.uint8, device=x.device)
 
-        grid = (num_blocks,)
+        # Amortize program scheduling across independent groups. One program
+        # per G32 group leaves most lanes idle with Triton's default 4 warps.
+        # Each group still evaluates the full candidate search independently;
+        # the compiler may change floating-point reduction order with layout.
+        blocks_per_program = 32
+        grid = (triton.cdiv(num_blocks, blocks_per_program),)
+        if numel == 0:
+            return q_out, scales_out, zp_out, orig_shape
         _fused_amo_quant_kernel[grid](
-            x_flat, q_out, scales_out, zp_out, x_flat.numel(),
+            x_flat, q_out, scales_out, zp_out, numel,
             GROUP_SIZE=group_size,
             NUM_CANDIDATES=num_candidates,
             LO=lo,
             HI=hi,
+            BLOCKS_PER_PROGRAM=blocks_per_program,
+            num_warps=2,
         )
-        return q_out[:numel], scales_out, zp_out, orig_shape
+        return q_out, scales_out, zp_out, orig_shape
 
 
     # -------------------------------------------------------------------------

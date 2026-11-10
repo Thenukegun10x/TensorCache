@@ -761,9 +761,9 @@ def quantize_int8_amo_bq(
     if mode is not None:
         num_candidates, lo, hi = _resolve_amo_preset(mode, None, None, None)
 
-    # Try fused Triton single-pass quant for GPU (offline but much faster)
-    # Skip fused for NaN/Inf (Triton min/max would propagate NaN)
-    if HAS_TRITON and x.is_cuda and x.device.type in ("cuda", "hip") and torch.isfinite(x).all():
+    # The fused kernel sanitizes non-finite values while loading. Avoid a
+    # separate finite scan and the host synchronization from testing its result.
+    if HAS_TRITON and x.is_cuda and x.device.type in ("cuda", "hip"):
         try:
             from .fused_ops import quantize_amo_fused_gpu
             return quantize_amo_fused_gpu(x, group_size=group_size, mode=mode, num_candidates=num_candidates, lo=lo, hi=hi)
