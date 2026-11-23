@@ -16,6 +16,10 @@ import torch
 from torch.utils.data import Dataset
 
 from .codec import pack_int4, unpack_int4, pack_int3, unpack_int3
+from ._validate import (
+    CacheValidationError, validate_pixel_meta, validate_xs_table,
+    check_xs_row_bounds, _check_file_size, _file_size,
+)
 
 try:
     import blosc2
@@ -497,6 +501,8 @@ class PixelCacheDataset(Dataset):
 
         with open(self.meta_path, "r") as f:
             self.meta = json.load(f)
+        _validated = validate_pixel_meta(self.meta, context="pixel cache")
+        self.meta.update(_validated)
 
         self.num_samples = self.meta["num_samples"]
         self.height = self.meta["height"]
@@ -677,6 +683,11 @@ class PixelCacheDataset(Dataset):
                 # Try both
                 if os.path.exists(str(self.cache_prefix) + "_" + self.meta["bin_file"]) or os.path.exists(self.meta["bin_file"]):
                     pass
+            _check_file_size(
+                self.bin_path,
+                self.num_samples * self.height * self.width * self.channels,
+                "raw pixels file",
+            )
             self.mmap_pixels = np.memmap(
                 self.bin_path, dtype=np.uint8, mode="r",
                 shape=(self.num_samples, self.height, self.width, self.channels)
@@ -686,17 +697,35 @@ class PixelCacheDataset(Dataset):
         elif self.quant == "xs":
             # Concatenated arena blobs + offset table (read-only mmaps).
             d = self.cache_prefix.parent
-            xf = self.meta["xs_files"]
-            self._xs_u8 = np.memmap(str(d / xf["u8"]), dtype=np.uint8, mode="r")
-            self._xs_i8 = np.memmap(str(d / xf["i8"]), dtype=np.int8, mode="r")
-            sh = self.meta["xs_shared"]
-            nrows = sum(r["n_planes"] for r in self.meta["xs_table"])
-            self._xs_meta = np.memmap(str(d / xf["meta"]), dtype=np.int32, mode="r",
+            xf = self.meta.get("xs_files")
+            if not isinstance(xf, dict):
+                raise CacheValidationError("xs cache: meta missing xs_files")
+            for key in ("u8", "i8", "meta", "ll4"):
+                if not isinstance(xf.get(key), str) or not xf[key]:
+                    raise CacheValidationError(f"xs cache: xs_files missing {key!r}")
+            sh = self.meta.get("xs_shared")
+            if not isinstance(sh, dict):
+                raise CacheValidationError("xs cache: meta missing xs_shared")
+            table = validate_xs_table(self.meta, context="xs cache")
+            u8_path = str(d / xf["u8"])
+            i8_path = str(d / xf["i8"])
+            meta_path_f = str(d / xf["meta"])
+            ll4_path = str(d / xf["ll4"])
+            u8_size = _file_size(u8_path, "xs u8 file")
+            i8_size = _file_size(i8_path, "xs i8 file")
+            ll4_size = _file_size(ll4_path, "xs ll4 file")
+            nrows = sum(r["n_planes"] for r in table)
+            _check_file_size(meta_path_f, nrows * 8 * np.dtype(np.int32).itemsize, "xs meta file")
+            for i, r in enumerate(table):
+                check_xs_row_bounds(r, u8_size, i8_size, ll4_size, nrows, context=f"xs cache row {i}")
+            self._xs_u8 = np.memmap(u8_path, dtype=np.uint8, mode="r")
+            self._xs_i8 = np.memmap(i8_path, dtype=np.int8, mode="r")
+            self._xs_meta = np.memmap(meta_path_f, dtype=np.int32, mode="r",
                                       shape=(nrows, 8))
             # ll4 is byte-addressable: pre-entropy caches store dense int16
             # (slices derived as elem_off*2), entropy caches store per-row
             # regions via lb_off/lb_len that may be planar-wrapped blobs.
-            self._xs_ll4 = np.memmap(str(d / xf["ll4"]), dtype=np.uint8, mode="r")
+            self._xs_ll4 = np.memmap(ll4_path, dtype=np.uint8, mode="r")
             self._xs_shared = sh
             self._xs_inv = [(n, c, h, w, m) for (n, c, h, w, m) in sh["inv"]]
             self._xs_codebook = torch.tensor(sh["codebook"], dtype=torch.float32)
@@ -723,6 +752,12 @@ class PixelCacheDataset(Dataset):
                     scales_path = str(self.cache_prefix) + f"_pixels_int{self.quant_bits}_scales.bin"
             self.q_path = q_path
             self.scales_path = scales_path
+            _check_file_size(q_path, self.num_samples * q_bytes, "quantized pixels file")
+            _check_file_size(
+                scales_path,
+                self.num_samples * self.blocks_per_sample * np.dtype(np.uint16).itemsize,
+                "quantized scales file",
+            )
             self.mmap_q = np.memmap(q_path, dtype=np.uint8, mode="r", shape=(self.num_samples, q_bytes))
             self.mmap_scales = np.memmap(scales_path, dtype=np.uint16, mode="r", shape=(self.num_samples, self.blocks_per_sample))
             self.mmap_pixels = None

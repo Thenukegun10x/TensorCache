@@ -16,6 +16,9 @@ import torch
 from torch.utils.data import Dataset
 
 from .codec import AMO_BQ_PRESETS, BlockwiseInt8Codec, dequantize_int8_g32, dequantize_int8_amo_bq
+from ._validate import (
+    validate_feature_meta, validate_feature_shards_manifest, _check_file_size,
+)
 
 
 class FeatureCacheWriter:
@@ -580,6 +583,10 @@ class FeatureCacheDataset(Dataset):
         if is_sharded:
             with open(shards_manifest, "r") as f:
                 manifest = json.load(f)
+            validated = validate_feature_shards_manifest(manifest, context="sharded feature cache")
+            # Update in place so extra keys (adaptive, shard_metas, amo_*, ...)
+            # survive on the public .meta attribute.
+            manifest.update(validated)
             self.meta = manifest
             self.is_sharded = True
             self.num_shards = manifest.get("num_shards", len(manifest.get("shard_prefixes", [])))
@@ -642,10 +649,25 @@ class FeatureCacheDataset(Dataset):
                 int8_dtype = np.uint8 if self.amo_bq else np.int8
                 int8_path = pref + "_int8.bin"
                 scales_path = pref + "_scales.bin"
+                _check_file_size(
+                    int8_path,
+                    sz * self.seq_len * self.dim * np.dtype(int8_dtype).itemsize,
+                    f"sharded int8 cache file ({pref})",
+                )
+                _check_file_size(
+                    scales_path,
+                    sz * self.scales_count * np.dtype(np.uint16).itemsize,
+                    f"sharded scales cache file ({pref})",
+                )
                 mm_int8 = np.memmap(int8_path, dtype=int8_dtype, mode="r", shape=(sz, self.seq_len, self.dim))
                 mm_sc = np.memmap(scales_path, dtype=np.uint16, mode="r", shape=(sz, self.scales_count))
                 if self.amo_bq:
                     zp_path = pref + "_zp.bin"
+                    _check_file_size(
+                        zp_path,
+                        sz * self.scales_count * np.dtype(np.uint8).itemsize,
+                        f"sharded zp cache file ({pref})",
+                    )
                     mm_zp = np.memmap(zp_path, dtype=np.uint8, mode="r", shape=(sz, self.scales_count))
                 else:
                     mm_zp = None
@@ -674,19 +696,34 @@ class FeatureCacheDataset(Dataset):
         
         with open(self.meta_path, "r") as f:
             self.meta = json.load(f)
-            
+        _validated = validate_feature_meta(self.meta, context="feature cache")
+        self.meta.update(_validated)
+
         self.num_samples = self.meta["num_samples"]
         self.seq_len = self.meta["seq_len"]
         self.dim = self.meta["dim"]
         self.group_size = self.meta["group_size"]
         self.auto_dequant_device = auto_dequant_device
         self.amo_bq = self.meta.get("amo_bq", False)
-        
+
         self.int8_path = str(self.cache_prefix) + "_int8.bin"
         self.scales_path = str(self.cache_prefix) + "_scales.bin"
-        
-        # Read-only memory mapping (dtype depends on mode)
+
+        # Fail fast on truncated/corrupt files before mmap
+        scales_count = (self.seq_len * self.dim + self.group_size - 1) // self.group_size
         int8_dtype = np.uint8 if self.amo_bq else np.int8
+        _check_file_size(
+            self.int8_path,
+            self.num_samples * self.seq_len * self.dim * np.dtype(int8_dtype).itemsize,
+            "int8 cache file",
+        )
+        _check_file_size(
+            self.scales_path,
+            self.num_samples * scales_count * np.dtype(np.uint16).itemsize,
+            "scales cache file",
+        )
+
+        # Read-only memory mapping (dtype depends on mode)
         self.mmap_int8 = np.memmap(
             self.int8_path, dtype=int8_dtype, mode="r",
             shape=(self.num_samples, self.seq_len, self.dim)
@@ -706,6 +743,11 @@ class FeatureCacheDataset(Dataset):
                     self.zp_path = zp_path_try
             else:
                 self.zp_path = str(self.cache_prefix) + "_zp.bin"
+            _check_file_size(
+                self.zp_path,
+                self.num_samples * self.scales_count * np.dtype(np.uint8).itemsize,
+                "zp cache file",
+            )
             self.mmap_zp = np.memmap(
                 self.zp_path, dtype=np.uint8, mode="r",
                 shape=(self.num_samples, self.scales_count)

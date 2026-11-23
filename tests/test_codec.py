@@ -642,11 +642,75 @@ def test_feature_cache_append_mode():
         print("[+] FeatureCache append mode test passed!")
 
 
+def test_validation_accepts_partially_filled_caches():
+    """Writers pre-allocate to capacity but persist only the appended count.
+
+    Read-side validation must accept an oversized backing file (np.memmap maps
+    a prefix) while still rejecting a genuinely truncated one.
+    """
+    import json
+    from tensorcache._validate import CacheValidationError
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # 1. Single-shard feature cache: capacity 10, only 3 appended.
+        p = Path(tmpdir) / "partial_feat"
+        w = FeatureCacheWriter(p, num_samples=10, seq_len=8, dim=16, group_size=32)
+        feats = torch.randn(3, 8, 16, dtype=torch.bfloat16)
+        w.append(feats)
+        w.close()
+        assert os.path.getsize(str(p) + "_int8.bin") > 3 * 8 * 16  # spare capacity
+        ds = FeatureCacheDataset(p)
+        assert len(ds) == 3
+        q, s = ds[0]
+        ref_q, ref_s, _ = quantize_int8_g32(feats[0], group_size=32)
+        assert torch.equal(q.flatten(), ref_q)
+        assert torch.equal(s, ref_s)
+        ds.close()
+
+        # 2. Raw pixel cache: capacity 10, only 3 appended.
+        p = Path(tmpdir) / "partial_pix"
+        w = PixelCacheWriter(p, num_samples=10, height=8, width=8, channels=3)
+        imgs = np.random.randint(0, 256, (3, 8, 8, 3), dtype=np.uint8)
+        for im in imgs:
+            w.append_image(im)
+        w.close()
+        ds = PixelCacheDataset(p)
+        assert len(ds) == 3
+        assert np.array_equal(ds[0].numpy(), imgs[0])
+        ds.close()
+
+        # 3. Sharded feature cache: capacity 10 (5+5), only 4 appended.
+        p = Path(tmpdir) / "partial_shard"
+        w = FeatureCacheWriter(p, num_samples=10, seq_len=8, dim=16,
+                               group_size=32, num_shards=2, adaptive=True)
+        w.append(torch.randn(4, 8, 16, dtype=torch.bfloat16))
+        w.close()
+        ds = FeatureCacheDataset(p)
+        assert ds.meta["num_samples"] == 4
+        # Validation must not strip extra manifest keys (regression).
+        assert ds.meta.get("adaptive") is True
+        assert isinstance(ds.meta.get("shard_metas"), list)
+        ds.close()
+
+        # 4. A truly truncated file must still be rejected (fail fast).
+        p = Path(tmpdir) / "partial_feat"
+        meta_path = str(p) + "_meta.json"
+        with open(meta_path) as f:
+            meta = json.load(f)
+        meta["num_samples"] = 100  # needs 100 rows; file only holds 10
+        with open(meta_path, "w") as f:
+            json.dump(meta, f)
+        with pytest.raises(CacheValidationError):
+            FeatureCacheDataset(p)
+        print("[+] Partial-fill cache validation test passed!")
+
+
 if __name__ == "__main__":
     test_quantize_dequantize_roundtrip()
     test_adaptive_quantize_roundtrip()
     test_feature_cache_disk_io()
     test_feature_cache_append_mode()
+    test_validation_accepts_partially_filled_caches()
     test_pixel_cache_disk_io()
     test_int4_int3_roundtrip()
     test_pixel_cache_quantized_disk_io()
